@@ -1,0 +1,19 @@
+[package]
+name = "zoda-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Micro and real-world benchmarks for the zoda DA stack"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }
+zoda-bls = { path = "../zoda-bls" }
+zoda-kzg = { path = "../zoda-kzg" }
+zoda-core = { path = "../zoda-core" }
+zoda-pq = { path = "../zoda-pq" }
+zoda-das = { path = "../zoda-das" }
+zoda-edas = { path = "../zoda-edas" }
+
+[[bin]]
+name = "zoda-bench"
+path = "src/main.rs"

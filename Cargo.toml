@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zoda-math",
+    "crates/zoda-bls",
+    "crates/zoda-kzg",
+    "crates/zoda-core",
+    "crates/zoda-pq",
+    "crates/zoda-das",
+    "crates/zoda-edas",
+    "crates/zoda-sybils",
+    "crates/zoda-rda",
+    "crates/zoda-archival",
+    "crates/zoda-bridges",
+    "crates/zoda-ethrex",
+    "crates/zoda",
+    "crates/zoda-bench",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/idrees2516/zoda"
+rust-version = "1.75"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

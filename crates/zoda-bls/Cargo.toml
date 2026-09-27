@@ -1,0 +1,9 @@
+[package]
+name = "zoda-bls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dependency-free BLS12-381: tower fields, G1/G2, optimal ate pairing, RFC 9380 hash-to-curve, BLS signatures"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }

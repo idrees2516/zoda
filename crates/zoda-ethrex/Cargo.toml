@@ -1,0 +1,12 @@
+[package]
+name = "zoda-ethrex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ethrex-compatible types: blob transactions, sidecars, KZG integration"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }
+zoda-bls = { path = "../zoda-bls" }
+zoda-kzg = { path = "../zoda-kzg" }
+zoda-edas = { path = "../zoda-edas" }

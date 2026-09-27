@@ -1,0 +1,11 @@
+[package]
+name = "zoda-bridges"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Light-client bridges: DA inclusion proofs, cross-chain message commitments"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }
+zoda-core = { path = "../zoda-core" }
+zoda-kzg = { path = "../zoda-kzg" }

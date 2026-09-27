@@ -1,0 +1,9 @@
+[package]
+name = "zoda-pq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lattice-based post-quantum polynomial commitments (Module-LWE/Module-SIS, BDLOP + Lyubashevsky Fiat-Shamir openings)"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }

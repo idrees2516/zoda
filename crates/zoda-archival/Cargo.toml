@@ -1,0 +1,11 @@
+[package]
+name = "zoda-archival"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Archival node service: column custody storage, snapshots, reconstruction from partial data"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }
+zoda-core = { path = "../zoda-core" }
+zoda-das = { path = "../zoda-das" }

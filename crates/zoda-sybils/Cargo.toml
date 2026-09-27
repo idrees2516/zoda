@@ -1,0 +1,10 @@
+[package]
+name = "zoda-sybils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sybil resistance: BLS-based sortition, stake-weighted sampling, peer scoring"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }
+zoda-bls = { path = "../zoda-bls" }

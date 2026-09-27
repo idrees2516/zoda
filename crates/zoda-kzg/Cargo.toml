@@ -1,0 +1,10 @@
+[package]
+name = "zoda-kzg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EIP-4844 evaluation-form KZG polynomial commitments with Pippenger MSM"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }
+zoda-bls = { path = "../zoda-bls" }

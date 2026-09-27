@@ -1,0 +1,9 @@
+[package]
+name = "zoda-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZODA tensor-code data availability protocol: NTT-based encoding, Fiat-Shamir bound sampling proofs, reconstruction"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }

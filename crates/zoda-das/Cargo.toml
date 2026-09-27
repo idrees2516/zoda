@@ -1,0 +1,10 @@
+[package]
+name = "zoda-das"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Data availability sampling: adaptive sampling plans, success probability, 2D tensor sampling over zoda-core"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }
+zoda-core = { path = "../zoda-core" }

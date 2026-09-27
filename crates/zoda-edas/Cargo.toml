@@ -1,0 +1,11 @@
+[package]
+name = "zoda-edas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EIP-7594 / PeerDAS erasure-coded data availability: cells, FK20 cell proofs, batch verification, recovery, custody groups"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }
+zoda-bls = { path = "../zoda-bls" }
+zoda-kzg = { path = "../zoda-kzg" }

@@ -1,0 +1,13 @@
+[package]
+name = "zoda-rda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Randomized data availability: adaptive sampling sessions with Bayesian confidence accounting"
+
+[dependencies]
+zoda-math = { path = "../zoda-math" }
+zoda-core = { path = "../zoda-core" }
+zoda-das = { path = "../zoda-das" }
+zoda-sybils = { path = "../zoda-sybils" }
+zoda-bls = { path = "../zoda-bls" }

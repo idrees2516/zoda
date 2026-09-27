@@ -1,0 +1,8 @@
+[package]
+name = "zoda-math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Finite fields, NTT, polynomial arithmetic, hashes and RNG for the zoda DA stack"
+
+[dependencies]
