@@ -10,6 +10,7 @@
 //! `FIELD_ELEMENTS_PER_BLOB = 4096`, `FIELD_ELEMENTS_PER_CELL = 64`,
 //! `CELLS_PER_EXT_BLOB = 128`, `NUMBER_OF_COLUMNS = 128`.
 
+use zoda_kzg::msm::G1J;
 use zoda_kzg::srs::{Setup, FIELD_ELEMENTS_PER_BLOB, FIELD_ELEMENTS_PER_EXT_BLOB};
 use zoda_math::{batch_invert, FftDomain, Fr, PrimeField};
 use zoda_math::ntt::bit_reversal_permutation_typed;
@@ -49,13 +50,16 @@ fn fr_from_be32(b: &[u8]) -> Option<Fr> {
     }
 }
 
-fn cells_to_fr(cells: &[Cell]) -> Vec<Vec<Fr>> {
+fn cells_to_fr(cells: &[Cell]) -> Result<Vec<Vec<Fr>>, String> {
     cells
         .iter()
         .map(|c| {
             (0..FIELD_ELEMENTS_PER_CELL)
-                .map(|i| fr_from_be32(&c[i * 32..(i + 1) * 32]).expect("canonical cell"))
-                .collect()
+                .map(|i| {
+                    fr_from_be32(&c[i * 32..(i + 1) * 32])
+                        .ok_or_else(|| "non-canonical cell element".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()
         })
         .collect()
 }
@@ -130,6 +134,16 @@ fn bit_reverse_proofs(mut v: Vec<zoda_bls::g1::G1Affine>) -> Vec<zoda_bls::g1::G
 /// Phase 1: 64 circulant Toeplitz columns → FFT → MSM against the
 /// precomputed setup columns. Phase 2: inverse G1-FFT (unscaled) and a
 /// final forward G1-FFT of size 128.
+///
+/// Performance notes (vs a from-scratch implementation):
+/// * the 128×64 phase-1 MSMs run against **precomputed Straus window
+///   tables** (6-bit windows over the fixed setup columns, built once
+///   per setup and cached) — each row costs 43 windowed rounds of
+///   mixed additions + 255 shared doublings, with no bucket
+///   decomposition per call;
+/// * the rows are spread across the available cores;
+/// * both G1-FFTs run through the Jacobian engine in `zoda-kzg::g1fft`
+///   (unit-twiddle and identity skips, batch normalization).
 pub fn fk20_cell_proofs(poly: &[Fr], setup: &Setup) -> Vec<zoda_bls::g1::G1Affine> {
     let n = FIELD_ELEMENTS_PER_BLOB;
     debug_assert!(poly.len() <= n);
@@ -165,83 +179,106 @@ pub fn fk20_cell_proofs(poly: &[Fr], setup: &Setup) -> Vec<zoda_bls::g1::G1Affin
             coeffs[j][i] = w_fft[i][j] * inv_n;
         }
     }
-    // setup columns: x_ext_fft_columns[row][offset] — precomputed in Setup
-    // lazily here (computed on the fly for API simplicity; the benchmark
-    // suite measures both paths).
+    // setup columns and their Straus tables (cached per setup)
     let columns = setup_columns(setup);
+    let tables = fk20_tables(setup);
 
-    // MSM each row against the setup column
-    let mut u: Vec<zoda_bls::g1::G1Projective> = (0..domain_size)
-        .map(|row| {
-            zoda_kzg::msm::msm(&columns[row], &coeffs[row])
-        })
-        .collect();
+    // phase-1 row MSMs, spread over the available cores
+    let mut u: Vec<G1J> = vec![G1J::identity(); domain_size];
+    {
+        let nthreads = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1)
+            .max(1);
+        let per = (domain_size + nthreads - 1) / nthreads;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for t in 0..nthreads {
+                let start = t * per;
+                if start >= domain_size {
+                    break;
+                }
+                let end = (start + per).min(domain_size);
+                let cols = &columns[start..end];
+                let tabs = &tables[start..end];
+                let cfs = &coeffs[start..end];
+                handles.push(scope.spawn(move || {
+                    (0..end - start)
+                        .map(|k| strauss_row_msm(&cols[k], &tabs[k], &cfs[k]))
+                        .collect::<Vec<G1J>>()
+                }));
+            }
+            let mut off = 0;
+            for h in handles {
+                let part = h.join().expect("fk20 row msm panicked");
+                u[off..off + part.len()].copy_from_slice(&part);
+                off += part.len();
+            }
+        });
+    }
 
-    // inverse G1-FFT (unscaled — prescaling absorbed above)
-    let inv_roots: Vec<Fr> = dom
-        .roots_of_unity()[..domain_size]
+    // inverse G1-FFT (unscaled — the 1/128 prescaling is absorbed above)
+    let inv_roots: Vec<Fr> = dom.roots_of_unity()[..domain_size]
         .iter()
         .map(|x| x.invert().unwrap())
         .collect();
-    u = g1_fft_inv(&u, &inv_roots);
+    let mut u2 = zoda_kzg::g1fft::g1_fft_jac(&u, &inv_roots);
     // zero the second half (v has degree r - 1)
-    for x in u.iter_mut().take(domain_size).skip(r) {
-        *x = zoda_bls::g1::G1Projective::identity();
+    for x in u2.iter_mut().take(domain_size).skip(r) {
+        *x = G1J::identity();
     }
     // final forward G1-FFT of size 128
     let roots: Vec<Fr> = dom.roots_of_unity()[..domain_size].to_vec();
-    let out = g1_fft(&u, &roots);
-    out.into_iter().map(|p| p.to_affine()).collect()
+    let out = zoda_kzg::g1fft::g1_fft_jac(&u2, &roots);
+    G1J::batch_normalize(&out)
 }
 
-/// Recursive FFT over G1 projective points (out-of-place, matching the
-/// c-kzg-4844 `g1_fft_fast` structure exactly: bit-reversed input access,
-/// natural-order output).
-fn g1_fft_rec(
-    out: &mut [zoda_bls::g1::G1Projective],
-    inp: &[zoda_bls::g1::G1Projective],
-    stride: usize,
-    roots: &[Fr],
-    roots_stride: usize,
-    n: usize,
-) {
-    let half = n / 2;
-    if half > 0 {
-        g1_fft_rec(out, inp, stride * 2, roots, roots_stride * 2, half);
-        g1_fft_rec(
-            &mut out[half..],
-            &inp[stride..],
-            stride * 2,
-            roots,
-            roots_stride * 2,
-            half,
-        );
-        for i in 0..half {
-            let t = out[i + half].mul_fr(&roots[i * roots_stride]);
-            out[i + half] = out[i].add(&t.neg());
-            out[i] = out[i].add(&t);
+/// Table-driven Straus MSM for one FK20 row: Σ coeffs[i]·points[i]
+/// against precomputed 6-bit multiple tables
+/// (`tables[i][d-1] = d·points[i]` for d in 1..=63). All window digits
+/// are extracted once per call.
+fn strauss_row_msm(
+    points: &[zoda_bls::g1::G1Affine],
+    tables: &[Vec<zoda_bls::g1::G1Affine>],
+    coeffs: &[Fr],
+) -> G1J {
+    const W: usize = 6;
+    const NWIN: usize = (256 + W - 1) / W; // 43
+    let n = points.len();
+    // window digits, window-major
+    let mut digits = vec![0u8; NWIN * n];
+    for (i, sc) in coeffs.iter().enumerate() {
+        let rr = sc.to_repr();
+        for w in 0..NWIN {
+            let lo = w * W;
+            let mut d = 0usize;
+            for b in 0..W {
+                let bit = lo + b;
+                if bit >= 256 {
+                    break;
+                }
+                if (rr[bit / 64] >> (bit % 64)) & 1 == 1 {
+                    d |= 1 << b;
+                }
+            }
+            digits[w * n + i] = d as u8;
         }
-    } else {
-        out[0] = inp[0];
     }
-}
-
-/// Forward FFT over G1 (length = input length; roots table covers the
-/// full domain, roots_stride = domain / n).
-pub fn g1_fft(input: &[zoda_bls::g1::G1Projective], roots: &[Fr]) -> Vec<zoda_bls::g1::G1Projective> {
-    let n = input.len();
-    let mut out = vec![zoda_bls::g1::G1Projective::identity(); n];
-    let rs = roots.len() / n;
-    g1_fft_rec(&mut out, input, 1, roots, rs, n);
-    out
-}
-
-/// Inverse (unscaled) FFT over G1.
-fn g1_fft_inv(
-    input: &[zoda_bls::g1::G1Projective],
-    inv_roots: &[Fr],
-) -> Vec<zoda_bls::g1::G1Projective> {
-    g1_fft(input, inv_roots)
+    let mut acc = G1J::identity();
+    for w in (0..NWIN).rev() {
+        if !acc.is_identity() {
+            for _ in 0..W {
+                acc = acc.double();
+            }
+        }
+        let dm = &digits[w * n..(w + 1) * n];
+        for (i, &d) in dm.iter().enumerate() {
+            if d != 0 && !points[i].infinity {
+                acc = acc.add_mixed(&tables[i][(d - 1) as usize]);
+            }
+        }
+    }
+    acc
 }
 
 thread_local! {
@@ -251,29 +288,42 @@ thread_local! {
     static FK20_COLUMNS: std::cell::RefCell<
         std::collections::HashMap<[u8; 48], std::rc::Rc<Vec<Vec<zoda_bls::g1::G1Affine>>>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// Cached Straus window tables for the FK20 column points:
+    /// `tables[row][offset][d-1] = d·columns[row][offset]` for d in 1..=63.
+    /// 63 affine multiples per point — ~49 MB for the 128×64 matrix,
+    /// built once per setup (a one-time cost mirroring c-kzg's
+    /// fixed-base precompute option).
+    static FK20_TABLES: std::cell::RefCell<
+        std::collections::HashMap<[u8; 48], std::rc::Rc<Vec<Vec<Vec<zoda_bls::g1::G1Affine>>>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn setup_key(setup: &Setup) -> [u8; 48] {
+    let v = setup.g1_monomial[0].to_compressed();
+    let mut k = [0u8; 48];
+    k.copy_from_slice(&v);
+    k
 }
 
 /// The FK20 setup columns: x_ext_fft_columns[row][offset] for row in
 /// 0..128, offset in 0..64 — computed from the monomial G1 setup
 /// (cached across calls).
 fn setup_columns(setup: &Setup) -> Vec<Vec<zoda_bls::g1::G1Affine>> {
-    return setup_columns_cached(setup).to_vec();
+    setup_columns_cached(setup).to_vec()
 }
 
 fn setup_columns_cached(setup: &Setup) -> std::rc::Rc<Vec<Vec<zoda_bls::g1::G1Affine>>> {
-    let key = {
-        let v = setup.g1_monomial[0].to_compressed();
-        let mut k = [0u8; 48];
-        k.copy_from_slice(&v);
-        k
-    };
+    let key = setup_key(setup);
     FK20_COLUMNS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(cols) = cache.get(&key) {
-            return cols.clone();
+        {
+            let c = cache.borrow();
+            if let Some(cols) = c.get(&key) {
+                return cols.clone();
+            }
         }
         let cols = std::rc::Rc::new(setup_columns_uncached(setup));
-        cache.insert(key, cols.clone());
+        cache.borrow_mut().insert(key, cols.clone());
         cols
     })
 }
@@ -293,18 +343,77 @@ fn setup_columns_uncached(setup: &Setup) -> Vec<Vec<zoda_bls::g1::G1Affine>> {
             x[i] = setup.g1_monomial[j];
         }
         // points = FFT_128(x padded to 128)
-        let mut padded = vec![zoda_bls::g1::G1Projective::identity(); circ];
+        let mut padded: Vec<G1J> = vec![G1J::identity(); circ];
         for (i, xi) in x.iter().enumerate() {
-            padded[i] = xi.to_projective();
+            padded[i] = G1J::from_affine(xi);
         }
         let dom = FftDomain::<Fr>::new(circ);
         let roots: Vec<Fr> = dom.roots_of_unity()[..circ].to_vec();
-        let pts = g1_fft(&padded, &roots);
-        for (row, p) in pts.iter().enumerate() {
-            out[row][offset] = p.to_affine();
+        let pts = zoda_kzg::g1fft::g1_fft_jac(&padded, &roots);
+        let affine = G1J::batch_normalize(&pts);
+        for (row, p) in affine.iter().enumerate() {
+            out[row][offset] = *p;
         }
     }
     out
+}
+
+/// Build (and cache) the Straus 6-bit window tables for the FK20
+/// columns. All 8,192 × 63 multiples are produced with one inversion
+/// via a single batch normalization.
+fn fk20_tables(setup: &Setup) -> std::rc::Rc<Vec<Vec<Vec<zoda_bls::g1::G1Affine>>>> {
+    let key = setup_key(setup);
+    FK20_TABLES.with(|cache| {
+        {
+            let c = cache.borrow();
+            if let Some(t) = c.get(&key) {
+                return t.clone();
+            }
+        }
+        let columns = setup_columns(setup);
+        const PER: usize = 63; // multiples 1..=63 per point
+        let total: usize = columns.len() * FIELD_ELEMENTS_PER_CELL * PER;
+        let mut flat: Vec<G1J> = Vec::with_capacity(total);
+        for row in &columns {
+            for p in row {
+                let base = G1J::from_affine(p);
+                let mut cur = base;
+                flat.push(base); // 1·P
+                for _ in 1..PER {
+                    cur = cur.add(&base);
+                    flat.push(cur);
+                }
+            }
+        }
+        let norm = G1J::batch_normalize(&flat);
+        let mut tables: Vec<Vec<Vec<zoda_bls::g1::G1Affine>>> =
+            Vec::with_capacity(columns.len());
+        let mut it = norm.into_iter();
+        for row in &columns {
+            let mut row_t = Vec::with_capacity(row.len());
+            for _ in row {
+                let tab: Vec<zoda_bls::g1::G1Affine> = (&mut it).take(PER).collect();
+                row_t.push(tab);
+            }
+            tables.push(row_t);
+        }
+        let t = std::rc::Rc::new(tables);
+        cache.borrow_mut().insert(key, t.clone());
+        t
+    })
+}
+
+/// Forward FFT over G1 (homogeneous in/out) — compatibility wrapper
+/// around the Jacobian engine in `zoda-kzg::g1fft`.
+pub fn g1_fft(
+    input: &[zoda_bls::g1::G1Projective],
+    roots: &[Fr],
+) -> Vec<zoda_bls::g1::G1Projective> {
+    let jacs: Vec<G1J> = input.iter().map(G1J::from_homogeneous).collect();
+    zoda_kzg::g1fft::g1_fft_jac(&jacs, roots)
+        .into_iter()
+        .map(|p| p.to_homogeneous())
+        .collect()
 }
 
 /// `verify_cell_kzg_proof_batch` — the EIP-7594 batch verification.
@@ -411,7 +520,7 @@ pub fn verify_cell_kzg_proof_batch(
     // commit via monomial MSM
     let mut column_cells = vec![vec![Fr::zero(); FIELD_ELEMENTS_PER_CELL]; CELLS_PER_EXT_BLOB];
     let mut column_used = vec![false; CELLS_PER_EXT_BLOB];
-    let cell_frs = cells_to_fr(cells);
+    let cell_frs = cells_to_fr(cells)?;
     for i in 0..n {
         let c = cell_indices[i] as usize;
         column_used[c] = true;
@@ -493,7 +602,7 @@ pub fn recover_cells_and_kzg_proofs(
         }
     }
     if n == CELLS_PER_EXT_BLOB {
-        let poly = cells_to_fr(cells);
+        let poly = cells_to_fr(cells)?;
         // treat as evaluations, produce proofs
         let coeffs = evals_to_coeffs(&poly.concat(), setup);
         let proofs = fk20_cell_proofs(&coeffs, setup);
@@ -739,5 +848,270 @@ mod tests {
         // groups extend monotonically with count
         let d = get_custody_groups([7u8; 32], 5);
         assert!(a.iter().all(|g| d.contains(g)));
+    }
+}
+
+/// Official consensus-spec-tests harness for the EIP-7594 (Fulu) cell
+/// suites: `compute_cells`, `compute_cells_and_kzg_proofs`,
+/// `verify_cell_kzg_proof_batch`, `recover_cells_and_kzg_proofs`,
+/// replayed against the mainnet trusted setup. Skipped unless the
+/// vector archive is present (see `zoda-kzg::spectest`).
+#[cfg(test)]
+mod spec_vectors {
+    use super::*;
+    use zoda_kzg::spectest::{for_each_case, load_mainnet_setup, vectors_dir, Sv};
+
+    fn setup() -> Option<zoda_kzg::srs::Setup> {
+        let dir = vectors_dir()?;
+        Some(load_mainnet_setup(&dir).expect("mainnet trusted setup"))
+    }
+
+    fn parse_cells(v: &Sv) -> Vec<Cell> {
+        v.as_list()
+            .expect("cell list")
+            .iter()
+            .map(|c| c.hex_array::<BYTES_PER_CELL>().expect("cell hex"))
+            .collect()
+    }
+
+    /// Parse a cell list; `None` marks structurally malformed entries
+    /// (wrong byte length) — such inputs must make the API error.
+    fn parse_cells_lenient(v: &Sv) -> Option<Vec<Cell>> {
+        let list = v.as_list().expect("cell list");
+        let mut out = Vec::with_capacity(list.len());
+        for c in list {
+            match c.hex_array::<BYTES_PER_CELL>() {
+                Some(cell) => out.push(cell),
+                None => return None,
+            }
+        }
+        Some(out)
+    }
+
+    fn parse_proofs(v: &Sv) -> Vec<[u8; 48]> {
+        v.as_list()
+            .expect("proof list")
+            .iter()
+            .map(|c| c.hex_array::<48>().expect("proof hex"))
+            .collect()
+    }
+
+    fn blob_of(case: &Sv) -> Vec<u8> {
+        case.get("input")
+            .and_then(|i| i.get("blob"))
+            .and_then(|b| b.hex())
+            .expect("blob hex")
+    }
+
+    #[test]
+    fn spec_vectors_compute_cells() {
+        let Some(setup) = setup() else {
+            eprintln!("skipping: consensus-spec-tests archive not present");
+            return;
+        };
+        let dir = vectors_dir().unwrap();
+        let mut n = 0;
+        let count = for_each_case(&dir, "fulu", "compute_cells", |name, case| {
+            let blob = blob_of(case);
+            let out = case.get("output").expect("output");
+            if out.is_null() {
+                assert!(
+                    compute_cells(&blob, &setup).is_err(),
+                    "{}: expected an error",
+                    name
+                );
+            } else {
+                let expect = parse_cells(out);
+                let got = compute_cells(&blob, &setup)
+                    .unwrap_or_else(|e| panic!("{}: unexpected error {}", name, e));
+                assert_eq!(got.len(), expect.len(), "{}: cell count", name);
+                for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+                    assert_eq!(g, e, "{}: cell {}", name, i);
+                }
+            }
+            n += 1;
+        });
+        assert_eq!(count, n);
+        eprintln!("compute_cells: {} cases passed", n);
+    }
+
+    #[test]
+    fn spec_vectors_compute_cells_and_kzg_proofs() {
+        let Some(setup) = setup() else {
+            eprintln!("skipping: consensus-spec-tests archive not present");
+            return;
+        };
+        let dir = vectors_dir().unwrap();
+        let mut n = 0;
+        let count = for_each_case(
+            &dir,
+            "fulu",
+            "compute_cells_and_kzg_proofs",
+            |name, case| {
+                let blob = blob_of(case);
+                let out = case.get("output").expect("output");
+                if out.is_null() {
+                    assert!(
+                        compute_cells_and_kzg_proofs(&blob, &setup).is_err(),
+                        "{}: expected an error",
+                        name
+                    );
+                } else {
+                    let lst = out.as_list().expect("[cells, proofs]");
+                    let expect_cells = parse_cells(&lst[0]);
+                    let expect_proofs = parse_proofs(&lst[1]);
+                    let (cells, proofs) = compute_cells_and_kzg_proofs(&blob, &setup)
+                        .unwrap_or_else(|e| panic!("{}: unexpected error {}", name, e));
+                    assert_eq!(cells.len(), expect_cells.len(), "{}: cells", name);
+                    for (i, (g, e)) in cells.iter().zip(expect_cells.iter()).enumerate() {
+                        assert_eq!(g, e, "{}: cell {}", name, i);
+                    }
+                    assert_eq!(proofs.len(), expect_proofs.len(), "{}: proofs", name);
+                    for (i, (g, e)) in proofs.iter().zip(expect_proofs.iter()).enumerate() {
+                        assert_eq!(g, e, "{}: proof {}", name, i);
+                    }
+                }
+                n += 1;
+            },
+        );
+        assert_eq!(count, n);
+        eprintln!("compute_cells_and_kzg_proofs: {} cases passed", n);
+    }
+
+    #[test]
+    fn spec_vectors_verify_cell_kzg_proof_batch() {
+        let Some(setup) = setup() else {
+            eprintln!("skipping: consensus-spec-tests archive not present");
+            return;
+        };
+        let dir = vectors_dir().unwrap();
+        let mut n = 0;
+        let count = for_each_case(
+            &dir,
+            "fulu",
+            "verify_cell_kzg_proof_batch",
+            |name, case| {
+                let input = case.get("input").expect("input");
+                let commitments: Vec<Vec<u8>> = input
+                    .get("commitments")
+                    .and_then(|v| v.as_list())
+                    .expect("commitments")
+                    .iter()
+                    .map(|c| c.hex().expect("hex"))
+                    .collect();
+                let cell_indices: Vec<u64> = input
+                    .get("cell_indices")
+                    .and_then(|v| v.as_list())
+                    .expect("cell_indices")
+                    .iter()
+                    .map(|c| match c {
+                        Sv::Int(i) => *i,
+                        _ => panic!("bad cell index"),
+                    })
+                    .collect();
+                let cells = parse_cells_lenient(input.get("cells").expect("cells"));
+                let out = case.get("output").expect("output");
+                match cells {
+                    None => {
+                        assert!(out.is_null(), "{}: malformed cells must error", name);
+                    }
+                    Some(cells) => {
+                        let proofs: Vec<Vec<u8>> = input
+                            .get("proofs")
+                            .and_then(|v| v.as_list())
+                            .expect("proofs")
+                            .iter()
+                            .map(|c| c.hex().expect("hex"))
+                            .collect();
+                        let comm_refs: Vec<&[u8]> =
+                            commitments.iter().map(|c| c.as_slice()).collect();
+                        let proof_refs: Vec<&[u8]> =
+                            proofs.iter().map(|c| c.as_slice()).collect();
+                        let got = verify_cell_kzg_proof_batch(
+                            &comm_refs,
+                            &cell_indices,
+                            &cells,
+                            &proof_refs,
+                            &setup,
+                        );
+                        match out {
+                            Sv::Null => assert!(got.is_err(), "{}: expected an error", name),
+                            Sv::Bool(expect) => {
+                                let v = got
+                                    .unwrap_or_else(|e| panic!("{}: unexpected error {}", name, e));
+                                assert_eq!(v, *expect, "{}", name);
+                            }
+                            other => panic!("{}: unexpected output {:?}", name, other),
+                        }
+                    }
+                }
+                n += 1;
+            },
+        );
+        assert_eq!(count, n);
+        eprintln!("verify_cell_kzg_proof_batch: {} cases passed", n);
+    }
+
+    #[test]
+    fn spec_vectors_recover_cells_and_kzg_proofs() {
+        let Some(setup) = setup() else {
+            eprintln!("skipping: consensus-spec-tests archive not present");
+            return;
+        };
+        let dir = vectors_dir().unwrap();
+        let mut n = 0;
+        let count = for_each_case(
+            &dir,
+            "fulu",
+            "recover_cells_and_kzg_proofs",
+            |name, case| {
+                let input = case.get("input").expect("input");
+                let cell_indices: Vec<u64> = input
+                    .get("cell_indices")
+                    .and_then(|v| v.as_list())
+                    .expect("cell_indices")
+                    .iter()
+                    .map(|c| match c {
+                        Sv::Int(i) => *i,
+                        _ => panic!("bad cell index"),
+                    })
+                    .collect();
+                let cells = parse_cells_lenient(input.get("cells").expect("cells"));
+                let out = case.get("output").expect("output");
+                match cells {
+                    None => {
+                        assert!(out.is_null(), "{}: malformed cells must error", name);
+                    }
+                    Some(cells) => {
+                        if out.is_null() {
+                            assert!(
+                                recover_cells_and_kzg_proofs(&cell_indices, &cells, &setup)
+                                    .is_err(),
+                                "{}: expected an error",
+                                name
+                            );
+                        } else {
+                            let lst = out.as_list().expect("[cells, proofs]");
+                            let expect_cells = parse_cells(&lst[0]);
+                            let expect_proofs = parse_proofs(&lst[1]);
+                            let (rcells, rproofs) =
+                                recover_cells_and_kzg_proofs(&cell_indices, &cells, &setup)
+                                    .unwrap_or_else(|e| panic!("{}: unexpected error {}", name, e));
+                            assert_eq!(rcells.len(), expect_cells.len(), "{}: cells", name);
+                            for (i, (g, e)) in rcells.iter().zip(expect_cells.iter()).enumerate() {
+                                assert_eq!(g, e, "{}: cell {}", name, i);
+                            }
+                            assert_eq!(rproofs.len(), expect_proofs.len(), "{}: proofs", name);
+                            for (i, (g, e)) in rproofs.iter().zip(expect_proofs.iter()).enumerate() {
+                                assert_eq!(g, e, "{}: proof {}", name, i);
+                            }
+                        }
+                    }
+                }
+                n += 1;
+            },
+        );
+        assert_eq!(count, n);
+        eprintln!("recover_cells_and_kzg_proofs: {} cases passed", n);
     }
 }

@@ -11,10 +11,9 @@
 
 use crate::msm;
 use std::path::Path;
-use zoda_bls::g1::{G1Affine, G1Projective};
+use zoda_bls::g1::G1Affine;
 use zoda_bls::g2::G2Affine;
-use zoda_bls::pairing::{pairing_check, G2Prepared};
-use zoda_bls::Fp;
+use zoda_bls::pairing::G2Prepared;
 use zoda_math::u256::hex_to_bytes;
 use zoda_math::{FftDomain, Fr, PrimeField};
 
@@ -215,6 +214,12 @@ impl Setup {
     }
 }
 
+/// Decode a "0x…" hex string into bytes (public helper for the spec
+/// vector harness).
+pub fn hex_bytes(s: &str) -> Option<Vec<u8>> {
+    zoda_math::u256::hex_to_bytes(s)
+}
+
 /// Bit-reverse a slice.
 pub fn bit_reverse<T>(v: &mut [T]) {
     let n = v.len();
@@ -285,30 +290,14 @@ fn inverse_roots(domain: &FftDomain<Fr>) -> Vec<Fr> {
         .collect()
 }
 
-/// Forward FFT over G1 with given twiddle order (used by FK20 too).
+/// Forward FFT over G1 with given twiddle order — thin wrapper around
+/// the Jacobian engine in `crate::g1fft` (unit-twiddle and identity
+/// skips, single batch normalization).
 pub fn g1_fft_with(input: &[G1Affine], roots: &[Fr]) -> Vec<G1Affine> {
-    // recursive Cooley-Tukey over projective points
-    fn rec(out: &mut [G1Projective], inp: &[G1Affine], stride: usize, roots: &[Fr], rstride: usize, n: usize) {
-        let half = n / 2;
-        if half == 0 {
-            out[0] = inp[0].to_projective();
-            return;
-        }
-        rec(out, inp, stride * 2, roots, rstride * 2, half);
-        rec(&mut out[half..], &inp[stride..], stride * 2, roots, rstride * 2, half);
-        for i in 0..half {
-            let w = roots[i * rstride];
-            let t = out[i + half].mul_fr(&w);
-            let u = out[i];
-            out[i] = u.add(&t);
-            out[i + half] = u.add(&t.neg());
-        }
-    }
-    let n = input.len();
-    let mut tmp = vec![G1Projective::identity(); n];
-    let roots = roots.to_vec();
-    rec(&mut tmp, input, 1, &roots, 1, n);
-    tmp.iter().map(|p| p.to_affine()).collect()
+    let jacs: Vec<crate::msm::G1J> =
+        input.iter().map(|p| crate::msm::G1J::from_affine(p)).collect();
+    let out = crate::g1fft::g1_fft_jac(&jacs, roots);
+    crate::msm::G1J::batch_normalize(&out)
 }
 
 /// Lagrange-form G1 points from monomial form: L_i(τ) = IFFT of τ-powers;

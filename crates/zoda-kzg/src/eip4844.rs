@@ -32,22 +32,41 @@ pub fn hash_to_bls_field(data: &[u8]) -> Fr {
 }
 
 /// `bytes_to_bls_field` with validation (< r, 32 bytes).
+///
+/// Fast path: parse the four 64-bit limbs directly (big-endian), check
+/// canonicality with three limb comparisons, and enter Montgomery form
+/// with a single multiplication — an order of magnitude cheaper than
+/// reduce-then-re-encode, which matters because every blob operation
+/// starts by parsing 4096 field elements.
 pub fn bytes_to_bls_field(b: &[u8]) -> Result<Fr, String> {
     if b.len() != BYTES_PER_FIELD_ELEMENT {
         return Err("field element must be 32 bytes".to_string());
     }
-    // big-endian
-    let mut le = [0u8; 32];
-    for (i, byte) in b.iter().rev().enumerate() {
-        le[i] = *byte;
+    let mut limbs = [0u64; 4]; // little-endian canonical limbs
+    for i in 0..4 {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&b[24 - i * 8..32 - i * 8]);
+        limbs[i] = u64::from_be_bytes(w);
     }
-    let fr = Fr::from_le_bytes_mod_order(&le);
-    // canonical check: re-encode and compare
-    let re = fr_to_bytes(fr);
-    if re != *b {
+    // canonicality: value < r (top-down limb comparison; equality —
+    // value == r — is also rejected)
+    let m = zoda_math::fr::FR_MODULUS;
+    let mut i = 4;
+    let mut all_equal = true;
+    while i > 0 {
+        i -= 1;
+        if limbs[i] != m[i] {
+            all_equal = false;
+            if limbs[i] > m[i] {
+                return Err("field element is not canonical (>= r)".to_string());
+            }
+            break;
+        }
+    }
+    if all_equal {
         return Err("field element is not canonical (>= r)".to_string());
     }
-    Ok(fr)
+    Ok(Fr::from_repr_limbs(limbs))
 }
 
 /// `bls_field_to_bytes`: big-endian 32 bytes.
@@ -76,9 +95,11 @@ pub fn blob_to_polynomial(blob: &[u8]) -> Result<Vec<Fr>, String> {
 
 /// `compute_challenge` (Fiat-Shamir for blob proofs).
 pub fn compute_challenge(blob: &[u8], commitment: &[u8; 48]) -> Fr {
-    let mut data = Vec::with_capacity(16 + 2 + blob.len() + 48);
+    let mut data = Vec::with_capacity(16 + 16 + blob.len() + 48);
     data.extend_from_slice(FIAT_SHAMIR_PROTOCOL_DOMAIN);
-    data.extend_from_slice(&(FIELD_ELEMENTS_PER_BLOB as u64).to_be_bytes());
+    // the degree separator is 16 bytes big-endian (the batch-verifier
+    // transcript uses 8 bytes — an intentional spec asymmetry)
+    data.extend_from_slice(&(FIELD_ELEMENTS_PER_BLOB as u128).to_be_bytes());
     data.extend_from_slice(blob);
     data.extend_from_slice(commitment);
     hash_to_bls_field(&data)
@@ -233,12 +254,24 @@ pub fn verify_kzg_proof(
     Ok(verify_kzg_proof_impl(&commitment, z, y, &proof, setup))
 }
 
-/// `validate_kzg_g1` + parse.
+/// `validate_kzg_g1` + parse: a canonical compressed encoding of a
+/// curve point **in the order-r subgroup** ([r]P = O; the pairing cannot
+/// detect h-torsion components, so the explicit check is required for
+/// soundness, matching c-kzg's `validate_kzg_g1`).
 pub fn bytes_to_kzg_commitment(b: &[u8]) -> Result<zoda_bls::g1::G1Affine, String> {
     if b.len() != BYTES_PER_COMMITMENT {
         return Err("commitment must be 48 bytes".to_string());
     }
-    zoda_bls::g1::G1Affine::from_compressed(b).ok_or_else(|| "invalid G1 point".to_string())
+    let p = zoda_bls::g1::G1Affine::from_compressed(b).ok_or("invalid G1 point")?;
+    if !p.is_identity() {
+        let r_mul = p
+            .to_projective()
+            .mul_limbs(&zoda_math::fr::FR_MODULUS);
+        if !r_mul.is_identity() {
+            return Err("G1 point not in subgroup".to_string());
+        }
+    }
+    Ok(p)
 }
 
 pub fn bytes_to_kzg_proof(b: &[u8]) -> Result<zoda_bls::g1::G1Affine, String> {

@@ -91,12 +91,60 @@ a blob transaction (versioned-hash consistency +
 `verify_blob_kzg_proof` per blob), and `validate_batch` the batched
 equivalent. See `ETHEX_INTEGRATION.md` for wiring instructions.
 
+## Official consensus-spec-tests vector conformance
+
+The workspace replays the **official `consensus-spec-tests` KZG vector
+archive** (release `v1.5.0`, `general` package) against the real mainnet
+ceremony trusted setup:
+
+| suite | fork | cases |
+|---|---|---:|
+| `blob_to_kzg_commitment` | Deneb (EIP-4844) | 11/11 ✔ |
+| `compute_kzg_proof` | Deneb | 52/52 ✔ |
+| `verify_kzg_proof` | Deneb | 122/122 ✔ |
+| `compute_blob_kzg_proof` | Deneb | 15/15 ✔ |
+| `verify_blob_kzg_proof` | Deneb | 29/29 ✔ |
+| `verify_blob_kzg_proof_batch` | Deneb | 24/24 ✔ |
+| `compute_cells` | Fulu (EIP-7594) | 11/11 ✔ |
+| `compute_cells_and_kzg_proofs` | Fulu | 11/11 ✔ |
+| `verify_cell_kzg_proof_batch` | Fulu | 30/30 ✔ |
+| `recover_cells_and_kzg_proofs` | Fulu | 15/15 ✔ |
+
+**320/320 cases pass bit-exactly** — every commitment, proof, cell and
+recovered codeword matches the reference vectors byte for byte, and
+every structurally invalid input is rejected exactly where the
+reference errors.
+
+Running the harness (optional; skipped unless the archive is present):
+
+```sh
+scripts/fetch_kzg_vectors.sh        # ~22 MB download into spec-vectors/
+cargo test -p zoda-kzg -p zoda-edas --release spec_vectors -- --nocapture
+```
+
+The harness is a self-contained YAML-subset parser plus per-suite
+replay drivers (`zoda-kzg::spectest`, `zoda-edas::spec_vectors`) — zero
+external dependencies, `ZODA_KZG_VECTORS`/`ZODA_TRUSTED_SETUP`
+environment overrides for non-default archive locations.
+
+**Bugs the official vectors caught** (all fixed):
+
+1. `compute_challenge` used an 8-byte degree separator; the Deneb spec
+   (and the vectors) use **16 bytes** — every blob-proof challenge was
+   non-conformant. (`verify_kzg_proof_batch` really does use 8 bytes —
+   an intentional spec asymmetry, now documented in code.)
+2. `validate_kzg_g1` did not check **subgroup membership**
+   (`[r]P = O`). The pairing cannot see h-torsion components, so
+   commitments outside the order-r subgroup would have verified
+   unsoundly. Every parsed commitment/proof now carries the check,
+   matching c-kzg.
+3. `verify_cell_kzg_proof_batch` panicked on cells containing
+   non-canonical field elements instead of returning an error (the
+   vectors expect `Err`, exactly like c-kzg's `bytes_to_bls_field`).
+
 ## Next steps (compliance roadmap)
 
-1. **Official vector harness**: consume the consensus-spec-tests
-   `kzg_mainnet` archives for `blob_to_kzg_commitment`,
-   `compute_(blob_)kzg_proof`, `verify_*` and the EIP-7594 cell suites;
-   wire as an optional test (skipped unless the archive is present).
+1. ~~**Official vector harness**~~ — **done** (see above; 320/320).
 2. **c-kzg FFI conformance runner**: differential test against the
    reference C library for randomized inputs.
 3. **SSZ encodings** for sidecar containers (currently types only).

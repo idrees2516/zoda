@@ -13,8 +13,10 @@
 //! * Pippenger multi-scalar multiplication for the MSM hot paths.
 
 pub mod eip4844;
+pub mod g1fft;
 pub mod msm;
 pub mod srs;
+pub mod spectest;
 
 pub use eip4844::*;
 pub use srs::{Setup, BLOB_BYTES, FIELD_ELEMENTS_PER_BLOB};

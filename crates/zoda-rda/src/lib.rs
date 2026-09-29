@@ -8,7 +8,7 @@
 
 use zoda_core::ZodaPublic;
 use zoda_das::{sample_session, SamplingPlan, SampleOracle, SessionReport};
-use zoda_math::{Fr, ZodaRng};
+use zoda_math::ZodaRng;
 use zoda_sybils::{Peer, Sortition};
 
 /// Session configuration.

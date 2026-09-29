@@ -45,14 +45,56 @@ pub fn reconstruct(
     let roots = &domain.roots_of_unity()[..width];
     let xs: Vec<Fr> = available_cols.iter().map(|&c| roots[c]).collect();
 
+    // All rows share the same interpolation nodes, so the Lagrange basis
+    // is built once (O(k²) via synthetic division of the shared vanishing
+    // polynomial + a single batch inversion) and every row reduces to an
+    // O(k²) weighted sum — no per-row subproduct tree.
+    let k = xs.len();
+    let z = zoda_math::poly::vanishing_poly(&xs);
+    let zprime = zoda_math::poly::derivative(&z);
+    let mut denominators: Vec<Fr> = xs
+        .iter()
+        .map(|x| zoda_math::poly::eval(&zprime, *x))
+        .collect();
+    zoda_math::batch_invert(&mut denominators);
+    // L_j = Z(X) / (X − x_j), scaled by 1/Z'(x_j)
+    let mut basis: Vec<Vec<Fr>> = Vec::with_capacity(k);
+    for j in 0..k {
+        // synthetic division of Z (degree k) by (X − x_j): exact, since
+        // Z(x_j) = 0. Top-down recurrence q_{t−1} = z_t + x_j·q_t.
+        let mut qq = vec![Fr::zero(); k];
+        let mut carry = Fr::zero();
+        for t in (0..k).rev() {
+            carry = z[t + 1] + carry * xs[j];
+            qq[t] = carry;
+        }
+        for t in 0..k {
+            qq[t] = qq[t] * denominators[j];
+        }
+        basis.push(qq);
+    }
+
     let mut out = Matrix::zeros(height, width);
-    for r in 0..height {
-        let ys: Vec<Fr> = available_cols.iter().map(|&c| partial.get(r, c)).collect();
-        // interpolate the degree-< k row polynomial
-        let coeffs = zoda_math::poly::interpolate(&xs, &ys);
-        // evaluate over the full domain
-        let mut evals = vec![Fr::zero(); width];
-        domain.fft_padded(&coeffs, &mut evals);
+    // per row: coeffs = Σ_j y_j · L_j, then evaluate over the full domain
+    let rows: Vec<Vec<Fr>> = (0..height)
+        .map(|r| {
+            let ys: Vec<Fr> = available_cols.iter().map(|&c| partial.get(r, c)).collect();
+            let mut coeffs = vec![Fr::zero(); k];
+            for j in 0..k {
+                let y = ys[j];
+                if y.is_zero() {
+                    continue;
+                }
+                for t in 0..k {
+                    coeffs[t] = coeffs[t] + y * basis[j][t];
+                }
+            }
+            let mut evals = vec![Fr::zero(); width];
+            domain.fft_padded(&coeffs, &mut evals);
+            evals
+        })
+        .collect();
+    for (r, evals) in rows.into_iter().enumerate() {
         for (c, v) in evals.iter().enumerate() {
             out.set(r, c, *v);
         }

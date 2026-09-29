@@ -4,11 +4,10 @@
 //!
 //! Suites implemented: `BLS12381G{1,2}_XMD:SHA-256_SSWU_RO_`.
 
-use crate::curve::Projective;
 use crate::fp::Fp;
 use crate::fp2::Fp2;
-use crate::g1::{G1Config, G1Projective};
-use crate::g2::{G2Config, G2Projective};
+use crate::g1::G1Projective;
+use crate::g2::G2Projective;
 use crate::h2c_consts::{g1_map, g2_map};
 use std::sync::OnceLock;
 
@@ -47,7 +46,7 @@ fn expand_message_xmd(msg: &[u8], dst: &[u8], len_in_bytes: usize) -> Vec<u8> {
     let ell = (len_in_bytes + 31) / 32;
     // DST_prime = DST || I2OSP(len(DST), 1); for long DSTs,
     // DST_prime = H(DST) || I2OSP(255, 1)
-    let mut dst_prime = if dst.len() > 255 {
+    let dst_prime = if dst.len() > 255 {
         let mut h = sha256(dst).to_vec();
         h.push(255);
         h

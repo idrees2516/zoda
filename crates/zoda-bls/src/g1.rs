@@ -69,9 +69,17 @@ impl CurveConfig for G1Config {
 
 pub type G1Projective = Projective<G1Config>;
 pub type G1Affine = Affine<G1Config>;
+pub type G1Jacobian = crate::curve::Jacobian<G1Config>;
 
 impl G1Projective {
     /// Multiply by the Fr scalar (little-endian limbs).
+    pub fn mul_fr(&self, scalar: &zoda_math::Fr) -> Self {
+        self.mul_limbs(&scalar.to_repr())
+    }
+}
+
+impl G1Jacobian {
+    /// Multiply by the Fr scalar.
     pub fn mul_fr(&self, scalar: &zoda_math::Fr) -> Self {
         self.mul_limbs(&scalar.to_repr())
     }

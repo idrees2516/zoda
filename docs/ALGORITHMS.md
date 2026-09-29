@@ -31,10 +31,20 @@ interpolate up with the Lagrange-merge `P_{S∪T} = P_S·Z_T + P_T·Z_S`.
 Fp12 = Fp6[w]/(w²−v). Karatsuba throughout; the Fp12 cyclotomic square is
 the Granger–Scott fp4-square decomposition.
 
-**Point arithmetic.** Renes–Costello–Batina complete formulas for a = 0
-curves (eprint 2015/1060, algorithms 7/8/9) in homogeneous projective
-coordinates: add(P,P), add(P,−P) and the identity all work with no
-special cases.
+**Point arithmetic.** Two coordinate systems, two roles:
+
+* **Homogeneous + RCB** (complete Renes–Costello–Batina formulas,
+  eprint 2015/1060, algorithms 7/8/9): add(P,P), add(P,−P) and the
+  identity need no special cases — used for on-curve validation and
+  wherever inputs are untrusted multiples.
+* **Jacobian** (the EFD "2007-bl" family): doubling 2M+5S
+  (`dbl-2007-bl`), mixed addition 7M+4S (`madd-2007-bl`), general
+  addition 11M+5S (`add-2007-bl`) — the hot-path engine behind every
+  MSM, FFT butterfly and scalar multiplication. The ±P degeneracies
+  (`H = 0`) are detected explicitly and routed to doubling / identity,
+  and Montgomery's trick batch-normalizes whole point arrays with a
+  single field inversion. Windowed (w = 5) scalar multiplication runs
+  on a projectively-built, batch-normalized table.
 
 **Optimal ate pairing.** Miller loop over the 64-bit BLS parameter
 x = −0xd201000000010000 using Beuchat–López-Tehraní doubled-line
@@ -59,14 +69,33 @@ with the special in-domain case handled by the spec's
 statements into 3 MSMs and one pairing via r-power random linear
 combinations.
 
-**MSM.** Pippenger with a size-adaptive window; the parallel path splits
-the batch across threads and sums the per-shard results.
+**MSM.** Pippenger's bucket method with the full modern treatment:
+window digits are extracted once per scalar (not per window), bucket
+accumulation runs in Jacobian coordinates against freshly-copied
+affine buckets (Z = 1), the classic all-levels running-prefix reduction
+computes Σ_j j·B_j with pristine buckets taking the cheaper mixed-add
+path, the window schedule adapts as c ≈ log₂n − log₂log₂n + 1
+(clamped to [4, 13]), a persistent thread-local bucket arena is reset
+only at touched entries, identity points are skipped, and large
+batches are chunked across threads (each chunk runs the full window
+schedule).
+
+**G1-FFT.** Cooley–Tukey over Jacobian points for point-polynomials
+P(X) = Σ pᵢXⁱ: (n/2)·log₂n twiddle scalar-multiplications with
+unit-twiddle and identity skips, natural-order output, batch
+normalization — the FK20 transform backbone.
 
 ## ZODA tensor code (zoda-core)
 
 **Systematic RS on the roots domain.** Data occupies the first k of 2k
-domain points: interpolate (subproduct tree) then evaluate (one NTT).
-Systematic because the first k evaluations reproduce the input.
+domain points: interpolate, then evaluate (one NTT). The interpolation
+nodes {ωⁱ} are a **geometric sequence**, so the transposed-Vandermonde
+identity applies: with cached barycentric weights wᵢ = 1/Z'(ωⁱ) and the
+cached Q(t) = Πⱼ(1 − ω^j t), each vector's monomial coefficients are
+cₖ = Σ_a Q_a·β_{n−1−k−a} from the u-weighted power sums
+βₘ = Σᵢ uᵢω^{im} (u = w ⊙ data) — no subproduct tree, no per-vector
+allocations, ~10x faster at k = 64. The row and column passes run in
+parallel across cores.
 
 **Tensor encoding.** Extend all rows (m×k → m×2k), then all columns
 (→ 2m×2k). By linearity every row of the result is a column-code
@@ -81,8 +110,10 @@ the committed row — probability 1/|F| per forgery attempt after the
 commitments fix g_r.
 
 **Reconstruction.** Any k of the 2k evaluations of a degree-<k polynomial
-determine it: interpolate each row from the available positions and
-re-evaluate on the full domain.
+determine it. All rows share the same erasure nodes, so the **Lagrange
+basis is built once** (synthetic division of the shared vanishing
+polynomial + one batch inversion) and every row reduces to an O(k²)
+weighted sum of the basis before a single re-evaluation NTT.
 
 ## EIP-7594 cells + FK20 (zoda-edas)
 
@@ -98,6 +129,11 @@ and multiplied component-wise against the FFT'd setup columns
 (precomputed and cached), giving the v(X) coefficients via MSMs and an
 unscaled inverse G1-FFT; (2) a final forward G1-FFT evaluates v at the
 128 cell positions. Proofs are bit-reversed to match cell order.
+The 128×64 phase-1 MSMs run against per-point **Straus window tables**
+(6-bit multiples of the fixed setup columns, built once per setup and
+cached — the same trade c-kzg makes with its fixed-base precompute),
+with rows spread over cores; both G1-FFTs use the Jacobian engine with
+unit-twiddle and identity skips.
 
 **Batch verification.** Deduplicate commitments, derive the
 RCKZGCBATCH__V1_ challenge, form the r-power-weighted sums of proofs
@@ -117,6 +153,14 @@ BDLOP Module-LWE commitments with Lyubashevsky σ-protocol openings — see
 the commitment equation C = A·r + B·m, narrow ring challenges, rejection
 sampling, and the R-linearity subtlety of ring-point evaluation
 (L(x·m) = x(ζ)·L(m) for admissible ζ with ζⁿ = −1).
+
+**Ring multiplication** is **density-aware**: dense × dense operands
+route through the negacyclic NTT (twist by ψⁱ, cyclic size-n transform,
+pointwise product, untwist — q − 1 has 2-adicity 13, so transforms up to
+length 8192 exist), while sparse operands (narrow weight-ω challenges,
+monomial evaluation points, scalars) stay on the zero-skipping
+schoolbook path with the sparser side driving the outer loop — three
+NTT passes cost more than they save below ≈ 3.5·log₂n nonzeros.
 
 ## Sampling statistics (zoda-das / zoda-rda)
 

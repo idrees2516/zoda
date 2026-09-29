@@ -77,7 +77,7 @@ impl Fp12 {
         z5 = t1 + self.c1.c2;
         z5 = z5 + z5 + t1;
 
-        let mut t0 = t3.mul_by_1_plus_u();
+        let t0 = t3.mul_by_1_plus_u();
         z2 = t0 + self.c1.c0;
         z2 = z2 + z2 + t0;
         z3 = t2 - self.c0.c2;

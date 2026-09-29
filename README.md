@@ -107,21 +107,28 @@ assert!(zoda::pq::LatticePcs::verify(&params, &com, &zeta, &v, &proof));
 
 ## Performance (2 vCPU host, release + LTO)
 
-| operation | time |
-|---|---|
-| `Fr` multiplication | **22 ns** |
-| NTT-8192 | 1.8 ms |
-| pairing (Miller + fountain final exp) | 1.57 ms |
-| BLS verify (2 pairings) | 3.7 ms |
-| ZODA verify row sample (64×64 grid) | **2.6 µs** |
-| ZODA commit (64×64 grid) | 252 ms |
-| `compute_cells` (EIP-7594) | 3.5 ms |
-| FK20 (128 cell proofs) | 1.84 s |
-| `verify_cell_kzg_proof_batch` (128 cells) | 85 ms |
-| recover 64→128 cells | 1.86 s |
-| PQ commit / open / verify (L1) | 50 / 60 / 37 ms |
+| operation | time | vs v1.0.0 |
+|---|---|---|
+| `Fr` multiplication | **22 ns** | — |
+| NTT-8192 | 1.8 ms | — |
+| pairing (Miller + fountain final exp) | 1.57 ms | — |
+| BLS verify (2 pairings) | 3.4 ms | 1.1x |
+| `blob_to_kzg_commitment` (4096 MSM) | 65 ms | **5.6x** |
+| ZODA verify row sample (64×64 grid) | **2.6 µs** | — |
+| ZODA commit (64×64 grid) | 39 ms | **6.6x** |
+| ZODA reconstruct (32 of 64 columns) | 2.4 ms | **14.7x** |
+| `compute_cells` (EIP-7594) | 2.9 ms | 1.2x |
+| FK20 (128 cell proofs) | 0.31 s | **6.0x** |
+| `verify_cell_kzg_proof_batch` (128 cells) | 49 ms† | 1.7x† |
+| recover 64→128 cells | 0.28 s | **6.6x** |
+| PQ commit / open / verify (L1) | 5.2 / 13 / 13 ms | **9.5 / 4.6 / 3.0x** |
 
-Full table and methodology: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+† now includes the spec-mandated subgroup validation of all 129 parsed
+points (~24 ms on this stack); excluding it the batch check runs in
+~25 ms (3.4x).
+
+Full table, before/after comparison and the optimization notes:
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## Documentation
 
@@ -138,9 +145,10 @@ Full table and methodology: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## Status & honesty
 
-* All Ethereum-flavoured crypto is validated against **official vectors**: RFC 9380 hash-to-curve (G1+G2), the mainnet KZG trusted setup parse + spec sanity check, and spec-shaped EIP-4844/7594 flows.
+* **Official consensus-spec-tests conformance: 320/320 vector cases pass bit-exactly** against the real mainnet ceremony setup — all six Deneb EIP-4844 suites (253 cases) and all four Fulu EIP-7594 cell suites (67 cases). Run it yourself: `scripts/fetch_kzg_vectors.sh && cargo test -p zoda-kzg -p zoda-edas --release spec_vectors`. The harness caught and fixed three real spec deviations (challenge-transcript encoding, missing subgroup validation, non-canonical cell handling).
+* All Ethereum-flavoured crypto is validated against **official vectors**: RFC 9380 hash-to-curve (G1+G2), the mainnet KZG trusted setup parse + spec sanity check, and the full EIP-4844/7594 vector suites above.
 * The lattice PQ commitment is a **research prototype**: parameter sets are first estimates, not audited. See `docs/POST_QUANTUM.md`.
-* The scalar-multiplication and MSM paths are correctness-first; they are slower than assembly-backed libraries (blst/c-kzg) by design trade-off. Hot paths are documented with optimization notes.
+* The group operations (Jacobian engine, Pippenger MSM, FK20 with Straus tables) are optimized pure Rust with no assembly and no unsafe code; they remain behind blst/c-kzg's ADX-assembly paths by roughly the expected asm/no-asm margin. Hot paths are documented with optimization notes in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## License
 

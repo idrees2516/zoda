@@ -31,6 +31,15 @@ mont_field!(
 
 mont_prime_field!(Fr, 4);
 
+/// The scalar-field modulus limbs (little-endian), for canonicality
+/// checks on raw encodings.
+pub const FR_MODULUS: [u64; 4] = [
+    0xffffffff00000001,
+    0x53bda402fffe5bfe,
+    0x3339d80809a1d805,
+    0x73eda753299d7d48
+];
+
 impl Fr {
     /// The primitive root of unity `7^((r-1)/2^k)` of order `2^k`.
     ///

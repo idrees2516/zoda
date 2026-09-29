@@ -52,7 +52,7 @@ impl Fp2 {
     /// Norm a·ā = c0² + c1² ∈ Fp.
     #[inline]
     pub fn norm(&self) -> Fp {
-        (self.c0 * self.c0 + self.c1 * self.c1)
+        self.c0 * self.c0 + self.c1 * self.c1
     }
 
     #[inline]
