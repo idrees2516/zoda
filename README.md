@@ -110,32 +110,22 @@ assert!(zoda::pq::LatticePcs::verify(&params, &com, &zeta, &v, &proof));
 
 ## Performance (2 vCPU host, release + LTO)
 
-| operation | time | vs v1.0.0 |
+| operation | time | note |
 |---|---|---|
-| `Fr` multiplication | **25 ns** | — |
-| NTT-8192 | 1.9 ms | — |
-| pairing (Miller + fountain final exp) | 2.0 ms | — |
-| BLS verify (2 pairings) | 4.1 ms | 1.1x |
-| `blob_to_kzg_commitment` (4096 MSM) | 69 ms | **5.6x** |
-| ZODA verify row sample (64×64 grid) | **2.6 µs** | — |
-| ZODA commit (64×64 grid) | **15.5 ms** | **16.5x** |
-| ZODA reconstruct (32 of 64 columns) | 2.4 ms | **14.7x** |
-| RS interpolation kernel (n = 1024) | **1.2 ms** | **49x vs the O(n²) loops** |
-| `reconstruct_2d` 64×64, 60% cells erased | 16 ms | new: arbitrary cell loss + full verify |
-| attested DAS session (16×16, 1 peer) | **438 µs** | new: projections + Merkle + peer scores |
-| custody ingest (verified column) | 297 µs | new |
-| `compute_cells` (EIP-7594) | 2.9 ms | 1.2x |
-| FK20 (128 cell proofs) | 0.31 s | **6.0x** |
-| `verify_cell_kzg_proof_batch` (128 cells) | 49 ms† | 1.7x† |
-| recover 64→128 cells | 0.28 s | **6.6x** |
-| PQ commit / open / verify (L1) | 5.3 / 13 / 13 ms | **9.5 / 4.6 / 3.0x** |
+| `Fr` multiplication (ADX/BMI2 Montgomery) | **30 ns** | runtime-dispatched `mulx`/`adcx`/`adox` |
+| pairing (Miller + fountain final exp) | **1.6 ms** | lazy-reduction Fp2 |
+| BLS verify (2-term pairing_check) | **2.9 ms** | 1.4x vs v1.2 |
+| BLS `verify_batch` x16 | **34.7 ms** | 1.35x vs individual verifies |
+| BLS sign | **1.4 ms** | psi-chain cofactor clearing (RFC 9380 G.3) |
+| G1 scalar mul (GLV 2-dim, public points) | **133 µs** | derived beta/lambda endomorphism |
+| `blob_to_kzg_commitment` (4096 MSM) | 65 ms | Pippenger, 2 threads |
+| `verify_cell_kzg_proof_batch` (128 cells) | **31.8 ms** | batched subgroup checks (4.3x on the checks) |
+| ZODA verify row sample (64x64 grid) | **2.6 µs** | |
+| ZODA commit (64x64 grid) | **15.5 ms** | |
+| `reconstruct_2d` 64x64, 60% cells erased | **10.8 ms** | parallel row/column fixpoint passes |
+| EigenDA-style batch verify (1024 cells) | **8.45 MB/s** | operator attestation throughput |
 
-† now includes the spec-mandated subgroup validation of all 129 parsed
-points (~24 ms on this stack); excluding it the batch check runs in
-~25 ms (3.4x).
-
-Full table, before/after comparison and the optimization notes:
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+Full tables, methodology and per-version history: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Documentation
 
@@ -155,7 +145,7 @@ Full table, before/after comparison and the optimization notes:
 * **Official consensus-spec-tests conformance: 320/320 vector cases pass bit-exactly** against the real mainnet ceremony setup — all six Deneb EIP-4844 suites (253 cases) and all four Fulu EIP-7594 cell suites (67 cases). Run it yourself: `scripts/fetch_kzg_vectors.sh && cargo test -p zoda-kzg -p zoda-edas --release spec_vectors`. The harness caught and fixed three real spec deviations (challenge-transcript encoding, missing subgroup validation, non-canonical cell handling).
 * All Ethereum-flavoured crypto is validated against **official vectors**: RFC 9380 hash-to-curve (G1+G2), the mainnet KZG trusted setup parse + spec sanity check, and the full EIP-4844/7594 vector suites above.
 * The lattice PQ commitment is a **research prototype**: parameter sets are first estimates, not audited. See `docs/POST_QUANTUM.md`.
-* The group operations (Jacobian engine, Pippenger MSM, FK20 with Straus tables) are optimized pure Rust with no assembly and no unsafe code; they remain behind blst/c-kzg's ADX-assembly paths by roughly the expected asm/no-asm margin. Hot paths are documented with optimization notes in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+* Since v1.3 the field layer closes most of the portable-Rust vs assembly gap with runtime-dispatched ADX/BMI2 Montgomery paths (`mulx`/`adcx`/`adox` codegen, no hand-written assembly, no external crates); GLV endomorphisms, lazy-reduction Fp2, batch verification and parallel 2D decode are documented in [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md).
 
 ## License
 

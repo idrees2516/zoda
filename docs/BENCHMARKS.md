@@ -2,6 +2,77 @@
 
 ## Methodology
 
+All numbers: release profile with LTO, 2 vCPU host, `zoda-bench`
+(`cargo run --release -p zoda-bench [-- <group>]`; groups: `math`, `bls`,
+`glv`, `kzg`, `edas`, `core`, `das2d`, `pq`, `eigenda`). Timings are wall
+clock averages after one warmup call.
+
+## Results (v1.3.0 — GLV, ADX field layer, batch verification, parallel 2D decode)
+
+### Pairing-stack and scalar multiplication
+
+| benchmark | v1.2.0 | v1.3.0 | change |
+|---|---|---|---|
+| pairing e(g1,g2) (Miller + fountain FE) | 2,014 µs | **1,604 µs** | 1.26x |
+| BLS verify (2-term pairing_check) | 4,086 µs | **2,915 µs** | 1.40x |
+| BLS sign (h2c G2 + scalar mul) | 2,133 µs | **1,391 µs** | 1.53x |
+| hash_to_curve G2 (incl. cofactor) | ~2.1 ms | **809 µs** | ~2.6x (psi-chain) |
+| G1 scalar mul (plain 255-bit) | 216 µs | 177 µs | 1.22x (field layer) |
+| G1 scalar mul (GLV 2-dim) | — | **133 µs** | 1.63x vs v1.2 plain |
+| G2 scalar mul (plain 255-bit) | — | 522 µs | reference |
+| G2 scalar mul (GLV 2-dim) | — | **477 µs** | 1.09x |
+
+The pairing stack gains come from the ADX/BMI2 Montgomery paths (runtime
+`#[target_feature]` clones emitting `mulx`/`adcx`/`adox`) and lazy-reduction
+Karatsuba Fp2 multiplication (three wide products + two REDCs instead of
+three fully reduced products).
+
+### Verification paths
+
+| benchmark | v1.2.0 | v1.3.0 | change |
+|---|---|---|---|
+| G1 subgroup check x129 (individual) | 24.9 ms | — | pre-v1.3 path |
+| G1 subgroup check x129 (batched MSM) | — | **5.7 ms** | 4.3x |
+| verify_cell_kzg_proof_batch (128 cells) | 48.8 ms | **31.8 ms** | 1.53x |
+| verify_blob_kzg_proof_batch (6 blobs) | 15.5 ms | 15.5 ms | flat (MSM-bound) |
+| BLS verify x16 (individual) | — | 47.1 ms | reference |
+| BLS verify_batch x16 | — | **34.7 ms** | 1.35x |
+| BLS verify_batch_strict x16 | — | 45.1 ms | subgroup soundness included |
+
+### 2D reconstruction and the EigenDA-style pipeline
+
+| benchmark | v1.2.0 | v1.3.0 | change |
+|---|---|---|---|
+| reconstruct_2d 64x64 (60% erased) | 16.0 ms | **10.8 ms** | 1.48x (parallel passes) |
+| FK20 compute_cells_and_kzg_proofs | ~310 ms | **280 ms** | 1.11x |
+| recover_cells_and_kzg_proofs (64) | ~290 ms | 292 ms | flat |
+| blob_to_kzg_commitment (4096 MSM) | 64.7 ms | 64.7 ms | flat (MSM-bound) |
+| compute_kzg_proof | "24.5 ms"* | **65.6 ms** | *corrected, see note |
+
+**Measurement correction**: the pre-v1.3 `compute_kzg_proof` bench fed a
+little-endian encoding of a possibly-unreduced scalar as `z`; the canonical
+big-endian parser rejected roughly half the draws, so the recorded average
+mixed ~85 µs fast-path errors with ~65 ms real runs. v1.3 fixes the harness
+(the spec vectors always exercised the real path — 320/320 remain green)
+and reports the true MSM-bound cost.
+
+### EigenDA-style operator pipeline (new)
+
+One batch = 8 blobs (1 MiB): commit (blob -> KZG), extend into 128 cells +
+FK20 proofs each, then a single batched cell verification (1024 cells):
+
+| phase | time | throughput |
+|---|---|---|
+| commit (blob -> KZG) | 513 ms | 2.04 MB/s |
+| extend + FK20 prove | 6,675 ms | 0.16 MB/s |
+| batch verify (1024 cells) | 124 ms | **8.45 MB/s** |
+| end-to-end | 7,313 ms | 0.14 MB/s |
+
+This is the base case for EigenLayer-level operator duties on a 2-vCPU
+host: attestation (batch verify) runs at 8.45 MB/s; proving throughput is
+setup-dominated (see headroom below).
+
+
 * Host: 2 vCPU cloud instance, rustc 1.98.1, release profile with
   thin-LTO and codegen-units=1. Numbers move ±20% between runs on this
   box; the table below is a representative full-suite run.

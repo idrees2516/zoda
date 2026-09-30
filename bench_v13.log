@@ -1,0 +1,94 @@
+warning: unused import: `ZodaRng`
+  --> crates/zoda-bls/src/endomorphism.rs:38:33
+   |
+38 | use zoda_math::{Fr, PrimeField, ZodaRng};
+   |                                 ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `g1_phi_j` is never used
+   --> crates/zoda-bls/src/endomorphism.rs:394:4
+    |
+394 | fn g1_phi_j(p: &Jacobian<G1Config>) -> Jacobian<G1Config> {
+    |    ^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `G2_H_EFF` is never used
+  --> crates/zoda-bls/src/hash.rs:17:18
+   |
+17 | pub(crate) const G2_H_EFF: [u64; 10] = [
+   |                  ^^^^^^^^
+
+warning: `zoda-bls` (lib) generated 3 warnings (run `cargo fix --lib -p zoda-bls` to apply 1 suggestion)
+   Compiling zoda-bench v1.2.0 (/home/z/my-project/zoda/crates/zoda-bench)
+    Finished `release` profile [optimized] target(s) in 11.94s
+     Running `target/release/zoda-bench`
+building KZG test setup (4096-point, deterministic tau)…
+  setup built in 5907.9 ms
+
+  EigenDA-style batch pipeline (8 blobs, 1 MiB):
+    commit (blob->KZG)           508.6 ms   2.06 MB/s
+    extend + FK20 prove         6834.1 ms   0.15 MB/s
+    batch verify (1024 cells)    125.2 ms   8.37 MB/s
+    end-to-end                  7467.9 ms   0.14 MB/s
+building KZG test setup (4096-point, deterministic tau)…
+  setup built in 5931.2 ms
+building EDAS setup…
+    -> rs_encode_vector n=128 throughput: 60.17 MB/s
+    -> rs_encode_vector n=512 throughput: 41.11 MB/s
+    -> rs_encode_vector n=2048 throughput: 33.39 MB/s
+
+====================================================================================================
+BENCHMARK                                                          TIME       UNIT   NOTES
+====================================================================================================
+Fr mul (Montgomery, 4 limbs)                                      0.030         µs   field core [1000000 iters]
+Fr invert (Fermat)                                               12.432         µs   batch-invert backbone [500 iters]
+NTT size 4096                                                   948.900         µs   262.14 KB/s/iter [200 iters]
+NTT size 8192                                                  2059.319         µs   524.29 KB/s/iter [200 iters]
+G1 scalar mul (windowed, 255-bit)                               191.767         µs   sign/pk path [50 iters]
+BLS sign (hash_to_curve G2 + mul)                              1390.848         µs   ETH2 ciphersuite [20 iters]
+BLS verify (2 pairings)                                        2915.354         µs   ETH2 ciphersuite [10 iters]
+pairing e(g1, g2) (miller + final exp)                         1604.381         µs   fountain chain [10 iters]
+G1 scalar mul (plain, 255-bit)                                  177.319         µs   reference path [50 iters]
+G1 scalar mul (GLV 2-dim)                                       132.843         µs   public points [50 iters]
+G2 scalar mul (plain, 255-bit)                                  522.105         µs   reference path [20 iters]
+G2 scalar mul (GLV 2-dim)                                       477.493         µs   public points [20 iters]
+hash_to_curve G2 (psi-chain cofactor)                           809.365         µs   RFC 9380 RO suite [50 iters]
+G1 subgroup check x129 (individual)                           24913.620         µs   pre-v1.3 path [3 iters]
+G1 subgroup check x129 (batched MSM)                           5737.833         µs   edas verify path [20 iters]
+BLS verify x16 (individual)                                   47059.530         µs   reference [2 iters]
+BLS verify_batch x16                                          34743.791         µs   1 final exp amortised [3 iters]
+BLS verify_batch_strict x16                                   45075.651         µs   batch subgroup + GLV [3 iters]
+eigenda pipeline (8 blobs e2e)                              7467913.639         µs   0.14 MB/s end-to-end
+blob_to_kzg_commitment (4096 MSM)                             64707.238         µs   EIP-4844 hot path [20 iters]
+compute_kzg_proof                                             65647.861         µs   quotient + MSM [20 iters]
+verify_kzg_proof (single)                                      3398.095         µs   2 pairings [20 iters]
+verify_blob_kzg_proof_batch (6 blobs)                         15495.077         µs   3 MSM + 1 pairing [10 iters]
+compute_cells (FFT 8192 + BRP)                                 3344.911         µs   EIP-7594 extension [20 iters]
+compute_cells_and_kzg_proofs (FK20)                          279686.746         µs   128 cell proofs, O(n log n) [5 iters]
+verify_cell_kzg_proof_batch (128 cells)                       31775.251         µs   1 pairing amortised [5 iters]
+recover_cells_and_kzg_proofs (from 64)                       343566.125         µs   erasure decode + FK20 [3 iters]
+ZODA commit (16x16 grid, full encode)                          2983.820         µs   2x NTT passes + Merkle + FS [5 iters]
+ZODA verify row sample (16x16)                                    0.732         µs   O(2k) inner product [100 iters]
+ZODA commit (64x64 grid, full encode)                         16724.777         µs   2x NTT passes + Merkle + FS [5 iters]
+ZODA verify row sample (64x64)                                    2.865         µs   O(2k) inner product [100 iters]
+ZODA reconstruct from 32 cols (32x32)                          2991.203         µs   per-row interpolation [3 iters]
+rs_encode_vector n=128                                          136.142         µs   O(n log n) FFT interpolation [20 iters]
+rs_encode_vector n=512                                          797.056         µs   O(n log n) FFT interpolation [20 iters]
+rs_encode_vector n=2048                                        3925.511         µs   O(n log n) FFT interpolation [20 iters]
+interp n=1024 [schoolbook O(n^2)]                             79167.664         µs   power sums + correlation loops [3 iters]
+interp n=1024 [FFT O(n log n)]                                 1358.107         µs   3 size-2n transforms [20 iters]
+Matrix transpose 256x256                                        726.326         µs   blocked, parallel [20 iters]
+reconstruct_2d 64x64 (60% cells erased)                       10778.349         µs   row/col fixpoint + full verify [3 iters]
+attested DAS session 16x16 (1 peer)                             448.774         µs   projection + Merkle, adaptive rounds [5 iters]
+custody put_column_verified 32x32                               497.710         µs   projection check + store [200 iters]
+custody try_reconstruct 32x32 (k cols)                         2774.811         µs   fixpoint decode + persist + verify [3 iters]
+PQ commit [FAST]                                                260.459         µs   MLWE commit; n=64, 4 chunks [10 iters]
+PQ open [FAST]                                                  279.581         µs   sigma-protocol + FS; n=64, 4 chunks [5 iters]
+PQ verify [FAST]                                                172.885         µs   2 equations; n=64, 4 chunks [10 iters]
+PQ commit [L1]                                                 5250.710         µs   MLWE commit; n=1024, 4 chunks [10 iters]
+PQ open [L1]                                                  13040.737         µs   sigma-protocol + FS; n=1024, 4 chunks [5 iters]
+PQ verify [L1]                                                12621.245         µs   2 equations; n=1024, 4 chunks [10 iters]
+====================================================================================================
+host: 2 cores

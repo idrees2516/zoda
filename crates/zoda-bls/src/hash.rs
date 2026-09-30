@@ -14,7 +14,10 @@ use std::sync::OnceLock;
 /// Effective cofactor for the G1 suite (RFC 9380 §8.8.1).
 const G1_H_EFF: [u64; 1] = [0xd201000000010001];
 /// Effective cofactor for the G2 suite (RFC 9380 §8.8.2), LE limbs.
-const G2_H_EFF: [u64; 10] = [
+/// The naive [h_eff] scalar — kept as the ground truth for the
+/// psi-chain cofactor-clearing equivalence test.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const G2_H_EFF: [u64; 10] = [
     0xe8020005aaa95551,
     0x59894c0adebbf6b4,
     0xe954cbc06689f6a3,
@@ -459,13 +462,15 @@ pub fn hash_to_curve_g2(msg: &[u8], dst: &[u8]) -> G2Projective {
     let us = hash_to_field_fp2(msg, dst, 2);
     let q0 = iso_map_g2(&map_to_curve_sswu_g2(&us[0]));
     let q1 = iso_map_g2(&map_to_curve_sswu_g2(&us[1]));
-    (q0 + q1).mul_limbs(&G2_H_EFF)
+    // fast cofactor clearing: the ψ/ψ2 endomorphism chain, exactly
+    // [h_eff]·(q0+q1) (see endomorphism::clear_cofactor_g2)
+    crate::endomorphism::clear_cofactor_g2(&(q0 + q1))
 }
 
 /// encode_to_curve for G2 (single-element, NU variant core).
 pub fn encode_to_curve_g2(msg: &[u8], dst: &[u8]) -> G2Projective {
     let u = hash_to_field_fp2(msg, dst, 1)[0];
-    iso_map_g2(&map_to_curve_sswu_g2(&u)).mul_limbs(&G2_H_EFF)
+    crate::endomorphism::clear_cofactor_g2(&iso_map_g2(&map_to_curve_sswu_g2(&u)))
 }
 
 #[cfg(test)]

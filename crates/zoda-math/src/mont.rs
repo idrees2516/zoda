@@ -8,6 +8,26 @@
 //! `Fp` (in `zoda-bls`) are generated from this macro, guaranteeing a single
 //! audited arithmetic core.
 
+/// Runtime ADX+BMI2 detection (x86_64). `std` caches the CPUID result in
+/// a relaxed atomic, so this is one predictable branch per call.
+///
+/// When available, multiplication and reduction route to
+/// `#[target_feature(enable = "adx", enable = "bmi2")]` clones of the
+/// portable bodies: LLVM then emits `mulx` (no rax/rdx serialisation) and
+/// the two independent carry chains `adcx`/`adox` - the bulk of the
+/// portable-Rust vs hand-written-assembly gap on x86.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn adx_bmi2() -> bool {
+    std::arch::is_x86_feature_detected!("adx") && std::arch::is_x86_feature_detected!("bmi2")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub fn adx_bmi2() -> bool {
+    false
+}
+
 /// Emit the core of a Montgomery-form prime field type (no trait impls).
 ///
 /// * `$name`  – type name
@@ -25,6 +45,161 @@ macro_rules! mont_field {
         #[derive(Copy, Clone, PartialEq, Eq, Hash, Default)]
         #[repr(transparent)]
         pub struct $name(pub [u64; $limbs]);
+
+        // --- shared arithmetic bodies (module level) -------------------
+        //
+        // macro_rules! definitions are not allowed inside impl blocks, so
+        // these live at module level and close over $name / $limbs
+        // textually. Source-level reuse between the portable `const fn`
+        // paths and the ADX/BMI2 `#[target_feature]` clones: identical
+        // algorithm, different instruction selection.
+        macro_rules! __mont_cios_body {
+            ($a:expr, $b:expr) => {{
+                let a: [u64; $limbs] = $a;
+                let b: [u64; $limbs] = $b;
+                let mut t = [0u64; $limbs + 2];
+                let mut i = 0;
+                while i < $limbs {
+                    let mut carry = 0u128;
+                    let mut j = 0;
+                    while j < $limbs {
+                        let s = t[j] as u128 + a[j] as u128 * b[i] as u128 + carry;
+                        t[j] = s as u64;
+                        carry = s >> 64;
+                        j += 1;
+                    }
+                    let s = t[$limbs] as u128 + carry;
+                    t[$limbs] = s as u64;
+                    t[$limbs + 1] = (s >> 64) as u64;
+
+                    let m = t[0].wrapping_mul($name::INV);
+                    let s = t[0] as u128 + m as u128 * $name::MODULUS[0] as u128;
+                    let mut carry = s >> 64;
+                    let mut j = 1;
+                    while j < $limbs {
+                        let s = t[j] as u128 + m as u128 * $name::MODULUS[j] as u128 + carry;
+                        t[j - 1] = s as u64;
+                        carry = s >> 64;
+                        j += 1;
+                    }
+                    let s = t[$limbs] as u128 + carry;
+                    t[$limbs - 1] = s as u64;
+                    let carry = s >> 64;
+                    t[$limbs] = t[$limbs + 1] + carry as u64;
+                    t[$limbs + 1] = 0;
+                    i += 1;
+                }
+
+                let mut res = [0u64; $limbs];
+                let mut i = 0;
+                while i < $limbs {
+                    res[i] = t[i];
+                    i += 1;
+                }
+                if t[$limbs] != 0 || $name::geq(&res, &$name::MODULUS) {
+                    let mut borrow = 0u64;
+                    let mut i = 0;
+                    while i < $limbs {
+                        let (d, b) = $name::sbb(res[i], $name::MODULUS[i], borrow);
+                        res[i] = d;
+                        borrow = b;
+                        i += 1;
+                    }
+                }
+                res
+            }};
+        }
+
+        // Wide schoolbook product `a·b` (no reduction). The result of
+        // two `< 2^(64·limbs)` operands always fits in `2·limbs` limbs.
+        macro_rules! __mont_wide_mul_body {
+            ($a:expr, $b:expr) => {{
+                let a: &[u64; $limbs] = $a;
+                let b: &[u64; $limbs] = $b;
+                let mut out = [0u64; 2 * $limbs];
+                let mut i = 0;
+                while i < $limbs {
+                    if a[i] != 0 {
+                        let mut carry = 0u128;
+                        let mut j = 0;
+                        while j < $limbs {
+                            let s =
+                                out[i + j] as u128 + (a[i] as u128) * (b[j] as u128) + carry;
+                            out[i + j] = s as u64;
+                            carry = s >> 64;
+                            j += 1;
+                        }
+                        let mut k = i + $limbs;
+                        while carry > 0 && k < 2 * $limbs {
+                            let s = out[k] as u128 + carry;
+                            out[k] = s as u64;
+                            carry = s >> 64;
+                            k += 1;
+                        }
+                    }
+                    i += 1;
+                }
+                out
+            }};
+        }
+
+        // Montgomery reduction (REDC) of a `2·limbs`-limb integer
+        // `T < m·R`: `T·R⁻¹ mod m`, fully reduced. One extra working
+        // limb absorbs intermediate carries; the REDC invariant keeps
+        // the running value below `m·R`, so carries terminate in-bounds.
+        macro_rules! __mont_redc_body {
+            ($t:expr) => {{
+                let t: &[u64; 2 * $limbs] = $t;
+                let mut w = [0u64; 2 * $limbs + 1];
+                let mut i = 0;
+                while i < 2 * $limbs {
+                    w[i] = t[i];
+                    i += 1;
+                }
+                let mut i = 0;
+                while i < $limbs {
+                    let m = w[i].wrapping_mul($name::INV);
+                    let s = w[i] as u128 + (m as u128) * ($name::MODULUS[0] as u128);
+                    w[i] = s as u64; // ≡ 0 by the choice of m
+                    let mut carry = s >> 64;
+                    let mut j = 1;
+                    while j < $limbs {
+                        let s = w[i + j] as u128
+                            + (m as u128) * ($name::MODULUS[j] as u128)
+                            + carry;
+                        w[i + j] = s as u64;
+                        carry = s >> 64;
+                        j += 1;
+                    }
+                    let mut k = i + $limbs;
+                    while carry > 0 && k <= 2 * $limbs {
+                        let s = w[k] as u128 + carry;
+                        w[k] = s as u64;
+                        carry = s >> 64;
+                        k += 1;
+                    }
+                    i += 1;
+                }
+                let mut res = [0u64; $limbs];
+                let mut i = 0;
+                while i < $limbs {
+                    res[i] = w[$limbs + i];
+                    i += 1;
+                }
+                if w[2 * $limbs] != 0 || $name::geq(&res, &$name::MODULUS) {
+                    let mut borrow = 0u64;
+                    let mut i = 0;
+                    while i < $limbs {
+                        let (d, b) = $name::sbb(res[i], $name::MODULUS[i], borrow);
+                        res[i] = d;
+                        borrow = b;
+                        i += 1;
+                    }
+                }
+                res
+            }};
+        }
+
 
         impl $name {
             pub const MODULUS: [u64; $limbs] = $mod;
@@ -61,56 +236,79 @@ macro_rules! mont_field {
             /// Montgomery multiplication (CIOS). Result fully reduced.
             #[inline(always)]
             pub const fn mont_mul(a: [u64; $limbs], b: [u64; $limbs]) -> [u64; $limbs] {
-                let mut t = [0u64; $limbs + 2];
-                let mut i = 0;
-                while i < $limbs {
-                    let mut carry = 0u128;
-                    let mut j = 0;
-                    while j < $limbs {
-                        let s = t[j] as u128 + a[j] as u128 * b[i] as u128 + carry;
-                        t[j] = s as u64;
-                        carry = s >> 64;
-                        j += 1;
-                    }
-                    let s = t[$limbs] as u128 + carry;
-                    t[$limbs] = s as u64;
-                    t[$limbs + 1] = (s >> 64) as u64;
+                __mont_cios_body!(a, b)
+            }
 
-                    let m = t[0].wrapping_mul(Self::INV);
-                    let s = t[0] as u128 + m as u128 * Self::MODULUS[0] as u128;
-                    let mut carry = s >> 64;
-                    let mut j = 1;
-                    while j < $limbs {
-                        let s = t[j] as u128 + m as u128 * Self::MODULUS[j] as u128 + carry;
-                        t[j - 1] = s as u64;
-                        carry = s >> 64;
-                        j += 1;
-                    }
-                    let s = t[$limbs] as u128 + carry;
-                    t[$limbs - 1] = s as u64;
-                    carry = s >> 64;
-                    t[$limbs] = t[$limbs + 1] + carry as u64;
-                    t[$limbs + 1] = 0;
-                    i += 1;
-                }
+            /// CIOS Montgomery multiplication specialised for ADX+BMI2
+            /// (`mulx` / `adcx` / `adox`). Semantically identical to
+            /// `mont_mul`; only the instruction selection differs.
+            #[cfg(target_arch = "x86_64")]
+            #[target_feature(enable = "adx", enable = "bmi2")]
+            unsafe fn mont_mul_adx(a: [u64; $limbs], b: [u64; $limbs]) -> [u64; $limbs] {
+                __mont_cios_body!(a, b)
+            }
 
-                let mut res = [0u64; $limbs];
-                let mut i = 0;
-                while i < $limbs {
-                    res[i] = t[i];
-                    i += 1;
-                }
-                if t[$limbs] != 0 || Self::geq(&res, &Self::MODULUS) {
-                    let mut borrow = 0u64;
-                    let mut i = 0;
-                    while i < $limbs {
-                        let (d, b) = Self::sbb(res[i], Self::MODULUS[i], borrow);
-                        res[i] = d;
-                        borrow = b;
-                        i += 1;
+            /// Runtime-dispatching Montgomery multiplication: the ADX/BMI2
+            /// clone when the CPU provides it, the portable body otherwise.
+            #[inline]
+            pub fn mont_mul_rt(a: [u64; $limbs], b: [u64; $limbs]) -> [u64; $limbs] {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if $crate::mont::adx_bmi2() {
+                        return unsafe { Self::mont_mul_adx(a, b) };
                     }
                 }
-                res
+                Self::mont_mul(a, b)
+            }
+
+            /// Wide schoolbook product (no reduction), for lazy-reduction
+            /// extension-field arithmetic.
+            #[inline]
+            pub const fn mul_wide(a: &[u64; $limbs], b: &[u64; $limbs]) -> [u64; 2 * $limbs] {
+                __mont_wide_mul_body!(a, b)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            #[target_feature(enable = "adx", enable = "bmi2")]
+            unsafe fn mul_wide_adx(a: &[u64; $limbs], b: &[u64; $limbs]) -> [u64; 2 * $limbs] {
+                __mont_wide_mul_body!(a, b)
+            }
+
+            /// Runtime-dispatching wide product.
+            #[inline]
+            pub fn mul_wide_rt(a: &[u64; $limbs], b: &[u64; $limbs]) -> [u64; 2 * $limbs] {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if $crate::mont::adx_bmi2() {
+                        return unsafe { Self::mul_wide_adx(a, b) };
+                    }
+                }
+                Self::mul_wide(a, b)
+            }
+
+            /// Montgomery reduction of a wide (unreduced) integer
+            /// `T < m·R` to a fully reduced `T·R⁻¹ mod m`.
+            #[inline]
+            pub const fn mont_reduce_wide(t: &[u64; 2 * $limbs]) -> [u64; $limbs] {
+                __mont_redc_body!(t)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            #[target_feature(enable = "adx", enable = "bmi2")]
+            unsafe fn mont_reduce_wide_adx(t: &[u64; 2 * $limbs]) -> [u64; $limbs] {
+                __mont_redc_body!(t)
+            }
+
+            /// Runtime-dispatching wide Montgomery reduction.
+            #[inline]
+            pub fn mont_reduce_wide_rt(t: &[u64; 2 * $limbs]) -> [u64; $limbs] {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if $crate::mont::adx_bmi2() {
+                        return unsafe { Self::mont_reduce_wide_adx(t) };
+                    }
+                }
+                Self::mont_reduce_wide(t)
             }
 
             const fn one_raw() -> [u64; $limbs] {
@@ -232,11 +430,11 @@ macro_rules! mont_field {
                     while b > 0 {
                         b -= 1;
                         if started {
-                            acc = Self::mont_mul(acc, acc);
+                            acc = Self::mont_mul_rt(acc, acc);
                         }
                         if (e[idx] >> b) & 1 == 1 {
                             if started {
-                                acc = Self::mont_mul(acc, base);
+                                acc = Self::mont_mul_rt(acc, base);
                             } else {
                                 acc = base;
                                 started = true;
@@ -295,7 +493,7 @@ macro_rules! mont_field {
             type Output = Self;
             #[inline(always)]
             fn mul(self, rhs: Self) -> Self {
-                Self(Self::mont_mul(self.0, rhs.0))
+                Self(Self::mont_mul_rt(self.0, rhs.0))
             }
         }
         impl core::ops::MulAssign for $name {

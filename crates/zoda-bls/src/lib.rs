@@ -25,6 +25,7 @@ pub mod fp6;
 pub mod fp12;
 pub mod g1;
 pub mod g2;
+pub mod endomorphism;
 pub mod hash;
 pub mod h2c_consts;
 pub mod pairing;
@@ -37,4 +38,7 @@ pub use fp12::Fp12;
 pub use g1::{G1Affine, G1Projective};
 pub use g2::{G2Affine, G2Projective};
 pub use pairing::{pairing, pairing_check, G2Prepared};
-pub use sig::{aggregate, verify, verify_aggregate, verify_strict, PublicKey, SecretKey, Signature};
+pub use sig::{
+    aggregate, aggregate_pks, verify, verify_aggregate, verify_batch, verify_batch_strict,
+    verify_strict, PublicKey, SecretKey, Signature,
+};

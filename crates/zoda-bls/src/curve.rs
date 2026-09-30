@@ -788,3 +788,114 @@ impl<C: CurveConfig> Jacobian<C> {
         }
     }
 }
+
+/// A signed magnitude that fits in three 64-bit limbs (≤ 192 bits) — the
+/// half-width scalar representation produced by GLV lattice decomposition.
+#[derive(Clone, Copy, Debug)]
+pub struct SignedMag {
+    pub neg: bool,
+    pub m: [u64; 3],
+}
+
+impl SignedMag {
+    pub fn zero() -> Self {
+        SignedMag { neg: false, m: [0; 3] }
+    }
+    pub fn is_zero(&self) -> bool {
+        self.m == [0u64; 3]
+    }
+    /// Number of significant bits in the magnitude.
+    pub fn bits(&self) -> usize {
+        for i in (0..3).rev() {
+            if self.m[i] != 0 {
+                return i * 64 + (64 - self.m[i].leading_zeros() as usize);
+            }
+        }
+        0
+    }
+    /// The W-bit window starting at bit `start` (bits above 192 read as 0).
+    fn window_at(&self, start: usize, w: usize) -> usize {
+        let mut v = 0usize;
+        for b in start..start + w {
+            if b < 192 && (self.m[b / 64] >> (b % 64)) & 1 == 1 {
+                v |= 1 << (b - start);
+            }
+        }
+        v
+    }
+}
+
+impl<C: CurveConfig> Jacobian<C> {
+    /// Build the w = 5 window table `[0·P, 1·P, …, 31·P]` in affine form
+    /// with a single field inversion (batch normalization).
+    pub fn window_table_32(&self) -> [Affine<C>; 32] {
+        const T: usize = 32;
+        let mut tab_proj = [Self::identity(); T];
+        tab_proj[1] = *self;
+        for i in 2..T {
+            tab_proj[i] = if i % 2 == 0 {
+                tab_proj[i / 2].double()
+            } else {
+                tab_proj[i - 1].add(self)
+            };
+        }
+        let mut out = [Affine::identity(); 32];
+        let norm = Self::batch_normalize(&tab_proj);
+        out[..T].copy_from_slice(&norm);
+        out
+    }
+}
+
+impl<C: CurveConfig> Jacobian<C> {
+    /// Interleaved w = 5 scan over two PRECOMPUTED affine tables:
+    /// `[k0]P + [k1]Q` where `tab_p`/`tab_q` hold `[0..32)` multiples.
+    /// Signs of the half-scalars must already be folded into the tables.
+    pub fn mul_two_tables(
+        tab_p: &[Affine<C>; 32],
+        tab_q: &[Affine<C>; 32],
+        k0: &SignedMag,
+        k1: &SignedMag,
+    ) -> Self {
+        const W: usize = 5;
+        let top = k0.bits().max(k1.bits());
+        if top == 0 {
+            return Self::identity();
+        }
+        let nwin = (top + W - 1) / W;
+        let mut acc = Self::identity();
+        let mut bit = nwin * W;
+        while bit > 0 {
+            let start = bit.saturating_sub(W);
+            if !acc.is_identity() {
+                for _ in 0..W {
+                    acc = acc.double();
+                }
+            }
+            let nib0 = k0.window_at(start, W);
+            let nib1 = k1.window_at(start, W);
+            if nib0 != 0 {
+                acc = acc.add_mixed(&tab_p[nib0]);
+            }
+            if nib1 != 0 {
+                acc = acc.add_mixed(&tab_q[nib1]);
+            }
+            bit = start;
+        }
+        acc
+    }
+}
+
+impl<C: CurveConfig> Jacobian<C> {
+    /// Interleaved windowed two-scalar multiplication `[k0]P + [k1]Q` over
+    /// half-width (≤ 192-bit) signed scalars — the GLV execution engine.
+    ///
+    /// Signs are folded into the table bases (`[−m]P = [m](−P)`); the two
+    /// w = 5 window tables are built together and batch-normalized with a
+    /// single field inversion; the shared scan halves the number of
+    /// point doublings compared to a full-width scalar multiplication.
+    pub fn mul_two_scalar(&self, q: &Self, k0: &SignedMag, k1: &SignedMag) -> Self {
+        let tab_p = if k0.neg { self.neg_j() } else { *self }.window_table_32();
+        let tab_q = if k1.neg { q.neg_j() } else { *q }.window_table_32();
+        Self::mul_two_tables(&tab_p, &tab_q, k0, k1)
+    }
+}

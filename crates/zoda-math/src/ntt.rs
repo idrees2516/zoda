@@ -42,6 +42,7 @@ impl FftField for crate::Fq {
 }
 
 /// A precomputed FFT domain of size `n = 2^log_n`.
+#[derive(Clone)]
 pub struct FftDomain<F: FftField> {
     /// transform size
     pub n: usize,

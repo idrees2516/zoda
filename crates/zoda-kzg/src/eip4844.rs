@@ -278,6 +278,102 @@ pub fn bytes_to_kzg_proof(b: &[u8]) -> Result<zoda_bls::g1::G1Affine, String> {
     bytes_to_kzg_commitment(b)
 }
 
+/// Parse a canonical compressed G1 point WITHOUT the r-subgroup check —
+/// for batch entry points that aggregate the checks via
+/// [`batch_subgroup_check_g1`] (one Pippenger MSM + one full scalar
+/// multiplication instead of n individual [r]P checks).
+pub fn parse_g1_canonical(b: &[u8]) -> Result<zoda_bls::g1::G1Affine, String> {
+    if b.len() != BYTES_PER_COMMITMENT {
+        return Err("commitment must be 48 bytes".to_string());
+    }
+    zoda_bls::g1::G1Affine::from_compressed(b).ok_or("invalid G1 point".to_string())
+}
+
+/// Batch r-subgroup check with **small-subgroup-safe** coefficients:
+/// `S = Σ cᵢ·Pᵢ` with `cᵢ = 1 + h₁·kᵢ` (kᵢ 128-bit random, from a
+/// transcript of the compressed points), then a single `[r]S == O` test.
+///
+/// The `≡ 1 (mod h₁)` structure is essential: plain random coefficients
+/// let a small-order point vanish from the combination whenever
+/// `ord(P) | cᵢ` (probability ~1/ord — grindable for tiny orders), while
+/// `cᵢ ≡ 1 (mod h₁)` guarantees every h₁-order component contributes
+/// itself. Coefficients stay ~254 bits (h₁ ≈ 2^126, kᵢ 128-bit), so the
+/// Pippenger MSM costs the same as with plain scalars, and one MSM plus
+/// one full multiplication replaces n individual `[r]P` checks.
+pub fn batch_subgroup_check_g1(points: &[zoda_bls::g1::G1Affine]) -> bool {
+    if points.is_empty() {
+        return true;
+    }
+    for p in points {
+        if !p.infinity && !p.is_on_curve() {
+            return false;
+        }
+    }
+    let mut transcript = Vec::new();
+    for p in points {
+        transcript.extend_from_slice(&p.to_compressed());
+    }
+    transcript.extend_from_slice(&(points.len() as u64).to_be_bytes());
+    let seed = zoda_math::sha256::sha256(&transcript);
+    let mut rng = zoda_math::ZodaRng::from_seed(seed);
+
+    // h₁ (3 limbs) and 2^256 mod r, both computed once
+    let h1 = zoda_bls::endomorphism::g1_cofactor_h1();
+    let two_pow_256 = {
+        // 2^256 mod r via five squarings-style doublings: 2^256 = (2^32)^8
+        // — simplest exact route: fold 1 << 256 through from_u64 doubling
+        let mut v = Fr::from_u64(1);
+        for _ in 0..256 {
+            v = v + v;
+        }
+        v
+    };
+
+    // c = 1 + h₁·k with a fresh 128-bit k per point; c < 2^(126+128+1)
+    // fits five limbs, reduced as c_lo (256 bits) + c[4]·2^256
+    let coeffs: Vec<Fr> = (0..points.len())
+        .map(|_| {
+            let k0 = rng.next_u64();
+            let k1 = rng.next_u64() & 0x7fff_ffff_ffff_ffff;
+            // h₁·k = h₁·(k0 + k1·2^64), schoolbook into 6 limbs
+            let mut c = [0u64; 6];
+            for (src, kk) in [(0usize, k0), (1, k1)] {
+                let mut carry = 0u128;
+                for i in 0..3 {
+                    let t = (h1[i] as u128) * (kk as u128) + carry + (c[i + src] as u128);
+                    c[i + src] = t as u64;
+                    carry = t >> 64;
+                }
+                let mut j = 3 + src;
+                while carry > 0 && j < 6 {
+                    let t = c[j] as u128 + carry;
+                    c[j] = t as u64;
+                    carry = t >> 64;
+                    j += 1;
+                }
+            }
+            // + 1 with carry propagation
+            let mut i = 0;
+            loop {
+                let (v, ov) = c[i].overflowing_add(1);
+                c[i] = v;
+                if !ov {
+                    break;
+                }
+                i += 1;
+            }
+            // reduce: c = c_lo + c[4]·2^256 (c[5] must be zero)
+            debug_assert_eq!(c[5], 0);
+            let lo_bytes: Vec<u8> = (0..4).rev().flat_map(|i| c[i].to_be_bytes()).collect();
+            let lo = Fr::from_be_bytes_mod_order(&lo_bytes);
+            let hi = Fr::from_u64(c[4]);
+            lo + two_pow_256 * hi
+        })
+        .collect();
+    let s = crate::msm::msm_jacobian(points, &coeffs);
+    s.mul_limbs(&zoda_math::fr::FR_MODULUS).is_identity()
+}
+
 /// `verify_kzg_proof_impl`: e(P − y·g1, g2_neg) · e(π, [X]₂ − z·[1]₂) == 1.
 pub fn verify_kzg_proof_impl(
     commitment: &zoda_bls::g1::G1Affine,
@@ -435,14 +531,20 @@ pub fn verify_blob_kzg_proof_batch(
         if blobs[i].len() != BLOB_BYTES {
             return Err("blob must be 131072 bytes".to_string());
         }
-        let commitment = bytes_to_kzg_commitment(commitments_bytes[i])?;
+        // subgroup checks are aggregated at the end (one MSM + one [r]P)
+        let commitment = parse_g1_canonical(commitments_bytes[i])?;
         let polynomial = blob_to_polynomial(blobs[i])?;
         let z = compute_challenge(blobs[i], &to_arr48(commitments_bytes[i])?);
         let y = evaluate_polynomial_in_evaluation_form(&polynomial, z, setup);
         commitments.push(commitment);
         zs.push(z);
         ys.push(y);
-        proofs.push(bytes_to_kzg_proof(proofs_bytes[i])?);
+        proofs.push(parse_g1_canonical(proofs_bytes[i])?);
+    }
+    let mut all_points = commitments.clone();
+    all_points.extend_from_slice(&proofs);
+    if !batch_subgroup_check_g1(&all_points) {
+        return Err("G1 point not in subgroup".to_string());
     }
     Ok(verify_kzg_proof_batch(&commitments, &zs, &ys, &proofs, setup))
 }

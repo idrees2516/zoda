@@ -107,6 +107,145 @@ pub fn aggregate(signatures: &[Signature]) -> Option<Signature> {
     Some(acc.to_affine())
 }
 
+/// Aggregate public keys (multiset sum, same-message aggregation helper).
+pub fn aggregate_pks(pks: &[PublicKey]) -> Option<PublicKey> {
+    if pks.is_empty() {
+        return None;
+    }
+    let mut acc = G1Projective::identity();
+    for pk in pks {
+        if pk.infinity {
+            return None;
+        }
+        acc = acc + pk.to_projective();
+    }
+    Some(acc.to_affine())
+}
+
+// ---------------------------------------------------------------------------
+// Batch verification
+// ---------------------------------------------------------------------------
+
+/// Random per-item coefficients derived from a transcript of every input
+/// (unpredictable before the full batch is fixed — grinding a bad batch
+/// that passes would take ~2^128 attempts per 128-bit coefficient).
+/// Returns two independent challenge sets (pairing, subgroup) so the two
+/// checks cannot be correlated.
+fn batch_challenges(
+    items: &[(&PublicKey, &[u8], &Signature)],
+) -> (Vec<zoda_math::Fr>, Vec<zoda_math::Fr>) {
+    let mut transcript = Vec::new();
+    for (pk, msg, sig) in items {
+        transcript.extend_from_slice(&pk.to_compressed());
+        transcript.extend_from_slice(&(msg.len() as u64).to_be_bytes());
+        transcript.extend_from_slice(msg);
+        transcript.extend_from_slice(&sig.to_compressed());
+    }
+    transcript.extend_from_slice(&(items.len() as u64).to_be_bytes());
+    let seed = zoda_math::sha256::sha256(&transcript);
+    let mut rng = zoda_math::ZodaRng::from_seed(seed);
+    let pairing = (0..items.len()).map(|_| rng.next_fr(true)).collect();
+    let subgroup = (0..items.len()).map(|_| rng.next_fr(true)).collect();
+    (pairing, subgroup)
+}
+
+/// Verify a batch of independent (pk, msg, sig) triples with one final
+/// exponentiation amortised over all items:
+///
+/// `Π e(rᵢ·pkᵢ, H(mᵢ)) · e(−g1, Σ rᵢ·σᵢ) == 1`
+///
+/// for transcript-derived random `rᵢ`. `n` Miller loops replace `2n`, and
+/// the single final exponentiation replaces `n` — roughly 2× per item over
+/// independent `verify` calls, with the same acceptance semantics
+/// (on-curve checks; h-torsion components pair to 1, exactly as in single
+/// verification, because the per-item scalar multiplications use the plain
+/// path on untrusted points).
+pub fn verify_batch(items: &[(&PublicKey, &[u8], &Signature)]) -> bool {
+    if items.is_empty() {
+        return true;
+    }
+    let challenges = batch_challenges(items);
+    let mut terms: Vec<(G1Affine, G2Prepared)> = Vec::with_capacity(items.len() + 1);
+    let mut sig_sum = G2Projective::identity();
+    for ((pk, msg, sig), r) in items.iter().zip(challenges.0.iter()) {
+        if pk.infinity || sig.infinity {
+            return false;
+        }
+        if !pk.is_on_curve() || !sig.is_on_curve() {
+            return false;
+        }
+        // plain (non-GLV) multiplication: pk/σ are untrusted, and the
+        // h-torsion behaviour must match single verification exactly
+        let rp = pk.to_projective().mul_limbs(&r.to_repr()).to_affine();
+        terms.push((rp, G2Prepared::from(hash_to_curve_g2(msg, DST).to_affine())));
+        let rs = sig.to_projective().mul_limbs(&r.to_repr());
+        sig_sum = sig_sum + rs;
+    }
+    let neg_g1 = G1Affine::generator().neg();
+    terms.push((neg_g1, G2Prepared::from(sig_sum.to_affine())));
+    let term_refs: Vec<(&G1Affine, &G2Prepared)> = terms.iter().map(|(a, b)| (a, b)).collect();
+    pairing_check(&term_refs)
+}
+
+/// Batch verification with full subgroup soundness: one Pippenger-based G1
+/// batch subgroup check over the public keys, one combined G2 check over
+/// the signatures, then the same product-pairing check as [`verify_batch`]
+/// — with GLV-accelerated scalar multiplications, since every point has
+/// been subgroup-verified first.
+pub fn verify_batch_strict(items: &[(&PublicKey, &[u8], &Signature)]) -> bool {
+    if items.is_empty() {
+        return true;
+    }
+    let pks: Vec<PublicKey> = items.iter().map(|(pk, _, _)| **pk).collect();
+    let sigs: Vec<Signature> = items.iter().map(|(_, _, sig)| **sig).collect();
+    if !crate::endomorphism::batch_subgroup_check_g2(&sigs) {
+        return false;
+    }
+    // individual on-curve and per-point G1 subgroup check via the batch
+    // combination (points must be on the curve first — decompression
+    // guarantees it, but re-check defensively for in-curve points)
+    for pk in &pks {
+        if pk.infinity || !pk.is_on_curve() {
+            return false;
+        }
+    }
+    // batch the G1 subgroup checks: S = Σ cᵢ·pkᵢ with INDEPENDENT
+    // challenges and PLAIN multiplications (correct semantics on any
+    // point of E(Fp) — GLV would be unsound pre-verification), then a
+    // single [r]S == O check
+    let challenges = batch_challenges(items);
+    {
+        let mut s = G1Projective::identity();
+        for (pk, c) in pks.iter().zip(challenges.1.iter()) {
+            if pk.infinity {
+                continue;
+            }
+            s = s + pk.to_projective().mul_limbs(&c.to_repr());
+        }
+        if !s.mul_limbs(&zoda_math::Fr::MODULUS).is_identity() {
+            return false;
+        }
+    }
+    // every point is now subgroup-verified: the pairing product may use
+    // the GLV fast path
+    let mut terms: Vec<(G1Affine, G2Prepared)> = Vec::with_capacity(items.len() + 1);
+    let mut sig_sum = G2Projective::identity();
+    for ((pk, msg, sig), r) in items.iter().zip(challenges.0.iter()) {
+        if sig.infinity {
+            return false;
+        }
+        let rp =
+            crate::endomorphism::mul_g1_public(&pk.to_projective(), r).to_affine();
+        terms.push((rp, G2Prepared::from(hash_to_curve_g2(msg, DST).to_affine())));
+        let rs = crate::endomorphism::mul_g2_public(&sig.to_projective(), r);
+        sig_sum = sig_sum + rs;
+    }
+    let neg_g1 = G1Affine::generator().neg();
+    terms.push((neg_g1, G2Prepared::from(sig_sum.to_affine())));
+    let term_refs: Vec<(&G1Affine, &G2Prepared)> = terms.iter().map(|(a, b)| (a, b)).collect();
+    pairing_check(&term_refs)
+}
+
 /// Verify an aggregate signature from `pks` all over the same `msg`.
 pub fn verify_aggregate(pks: &[PublicKey], msg: &[u8], sig: &Signature) -> bool {
     if pks.is_empty() {
@@ -125,6 +264,72 @@ pub fn verify_aggregate(pks: &[PublicKey], msg: &[u8], sig: &Signature) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fp::Fp;
+    use crate::fp2::Fp2;
+    use crate::g2::G2Config;
+    use crate::curve::CurveConfig;
+
+    fn random_bad_g2_point(seed: u64) -> Signature {
+        // a point on E'(Fp2) outside G2 (on-curve, wrong subgroup)
+        let mut rng = zoda_math::ZodaRng::from_seed(*b"sig-batch-bad-000000000000000000");
+        let _ = seed;
+        loop {
+            let mut b0 = [0u8; 32];
+            let mut b1 = [0u8; 32];
+            rng.next_bytes(&mut b0);
+            rng.next_bytes(&mut b1);
+            let x = Fp2::new(Fp::from_le_bytes32(&b0), Fp::from_le_bytes32(&b1));
+            let y2 = x * x * x + G2Config::b();
+            if let Some(y) = y2.sqrt() {
+                return G2Affine { x, y, infinity: false };
+            }
+        }
+    }
+
+    #[test]
+    fn batch_verify_accepts_valid_and_rejects_bad() {
+        let sks: Vec<_> = (0..8)
+            .map(|i| SecretKey::from_seed(format!("zoda batch key {}", i).as_bytes()))
+            .collect();
+        let msgs: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("batch message {}", i).into_bytes())
+            .collect();
+        let items: Vec<(PublicKey, Vec<u8>, Signature)> = sks
+            .iter()
+            .zip(msgs.iter())
+            .map(|(sk, m)| {
+                let sig = sk.sign(m);
+                (sk.public_key(), m.clone(), sig)
+            })
+            .collect();
+        let refs: Vec<(&PublicKey, &[u8], &Signature)> =
+            items.iter().map(|(p, m, s)| (p, m.as_slice(), s)).collect();
+        assert!(verify_batch(&refs));
+        assert!(verify_batch_strict(&refs));
+        // one tampered signature breaks both
+        let mut bad = items.clone();
+        bad[3].2 = sks[0].sign(&msgs[0]); // wrong message's signature
+        let refs: Vec<(&PublicKey, &[u8], &Signature)> =
+            bad.iter().map(|(p, m, s)| (p, m.as_slice(), s)).collect();
+        assert!(!verify_batch(&refs));
+        assert!(!verify_batch_strict(&refs));
+        // a wrong public key breaks both
+        let mut bad = items.clone();
+        bad[5].0 = sks[7].public_key();
+        let refs: Vec<(&PublicKey, &[u8], &Signature)> =
+            bad.iter().map(|(p, m, s)| (p, m.as_slice(), s)).collect();
+        assert!(!verify_batch(&refs));
+        assert!(!verify_batch_strict(&refs));
+        // a non-G2 signature (on-curve, wrong subgroup) is caught by strict
+        let mut bad = items.clone();
+        bad[2].2 = random_bad_g2_point(1);
+        let refs: Vec<(&PublicKey, &[u8], &Signature)> =
+            bad.iter().map(|(p, m, s)| (p, m.as_slice(), s)).collect();
+        assert!(!verify_batch_strict(&refs));
+        // empty batch is trivially true
+        assert!(verify_batch(&[]));
+        assert!(verify_batch_strict(&[]));
+    }
 
     #[test]
     fn sign_verify_roundtrip() {

@@ -4,6 +4,96 @@ This is the math inside every hot path, with references.
 
 ## Field arithmetic (zoda-math)
 
+### ADX/BMI2 Montgomery (v1.3)
+
+`mont_field!` emits both the portable `const fn` CIOS body and an ADX/BMI2
+clone under `#[target_feature(enable = "adx", enable = "bmi2")]`, selected
+at runtime by cached CPUID detection (`zoda_math::mont::adx_bmi2`). On the
+feature-enabled clone LLVM emits `mulx` (no implicit rax/rdx serialisation)
+and the two independent carry chains `adcx`/`adox` — the largest single
+component of the portable-Rust vs hand-written-assembly gap on x86. The
+same macro also emits wide multiplication (`mul_wide`, unreduced 2L limbs)
+and wide Montgomery reduction (`mont_reduce_wide`, REDC of a 2L-limb value
+below `m·R` to a fully reduced result), the primitives behind
+lazy-reduction extension fields.
+
+## BLS12-381 (zoda-bls)
+
+### Lazy-reduction Fp2 (v1.3)
+
+Fp2 multiplication is Karatsuba over wide (unreduced) products:
+`c0 = T − U`, `c1 = V − T − U` with `T = a0b0`, `U = a1b1`,
+`V = (a0+a1)(b0+b1)` as 12-limb integers, then two REDCs instead of three
+fully reduced Fp products. Positivity comes from a precomputed `4p^2`
+offset (`p^2 ≡ 0 mod p`, so the residue class is untouched); every
+intermediate stays below `8p^2 < p·R`, the REDC-valid range. Squaring uses
+the complex trick `(a+b)(a−b), 2ab` with two wide products.
+
+### GLV endomorphisms (v1.3, `endomorphism.rs`)
+
+* **G1**: the j = 0 automorphism `φ(x,y) = (βx, y)` (β a primitive cube
+  root of unity in Fp, derived as `g^((p−1)/3)`) acts on G1 as `[λ]` with
+  `λ² + λ + 1 = 0 mod r`; λ is *derived* as `−p² mod r` (p² is a primitive
+  6th root of unity mod r because `r | Φ₁₂(p)`) and matched to β through
+  the canonical generator — no transcribed constants.
+* **G2**: the untwist–Frobenius–twist endomorphism
+  `ψ(x,y) = (α·x̄, β₂·ȳ)` (Frobenius on Fp2 is conjugation since
+  `p ≡ 3 mod 4`) acts as `[λ₂]` with **λ₂ = p mod r** — a primitive 12th
+  root of unity satisfying `λ₂⁴ − λ₂² + 1 = 0`. (λ₂, α, β₂) are derived by
+  scanning the odd powers of p mod r and verifying that the coordinate
+  ratios `x([λ₂]Q)·x̄(Q)⁻¹` transfer across independent points, plus the
+  curve constraint `α³ = β₂² = ξ/ξ̄`.
+* **Decomposition**: a Lagrange–Gauss reduced basis of
+  `L = {(x,y) : x + λy ≡ 0 mod r}` (determinant r, vector norms ~√r) plus
+  Babai nearest-plane rounding splits any scalar into
+  `k ≡ k₀ + k₁λ (mod r)` with `|kᵢ| < 2^134`, exactly and with 640-bit
+  signed-bignum arithmetic at init.
+* **Execution**: `Jacobian::mul_two_tables` scans two w = 5 tables
+  interleaved — the doublings halve versus a full-width scan. The second
+  table is *derived* from the first by the coordinate map
+  (`φ([i]P) = [i]φ(P)`): one field multiply per entry instead of a table
+  of curve additions. Net: G1 1.63x, G2 1.09x over the plain path.
+* **Scope**: `mul_*_public` is variable-time and valid only on the
+  r-torsion; it is used exclusively for subgroup-verified public points
+  (never secret scalars — signing keeps the plain windowed path, and
+  subgroup checks themselves never use GLV, since φ = [λ] fails off the
+  r-torsion and would make the check vacuous).
+
+### Fast cofactor clearing on G2 (v1.3)
+
+`clear_cofactor_g2` implements the RFC 9380 Appendix G.3 (Budroni–Pintore)
+chain: `c1 = −BLS_X`, `t1 = c1·P`, `t2 = ψ(P)`, `t3 = ψ2(2P) − t2`,
+`t2 = c1·(t1+t2)`, `Q = t3 + t2 − t1 − P`, with
+`ψ2(x,y) = (c₁₂·x, −y)`, `c₁₂ = 2^−((p−1)/3)` (verified ψ2 = ψ∘ψ). Two
+64-bit scalar multiplications and coordinate maps replace the naive
+640-bit `[h_eff]·P` — the RFC 9380 test vectors pin bit-exactness.
+
+### Batch verification (v1.3)
+
+* **BLS `verify_batch`**: `Π e(rᵢ·pkᵢ, H(mᵢ)) · e(−g1, Σ rᵢ·σᵢ) == 1`
+  with transcript-derived random challenges — n Miller loops and ONE final
+  exponentiation. The per-item multiplications stay on the plain path
+  (untrusted points), preserving exactly the h-torsion semantics of single
+  verification.
+* **`verify_batch_strict`** adds subgroup soundness first: a combined G2
+  per-point check and a G1 random-combination check with *independent*
+  challenges, after which every point is subgroup-verified and the pairing
+  product may use the GLV fast paths.
+
+### Batch subgroup checks and the small-subgroup trap (v1.3)
+
+Batching `[r]Pᵢ == O` as `[r](Σ cᵢPᵢ) == O` with naive random `cᵢ` is
+**unsound**: a point of small order d (small factors divide the cofactors)
+vanishes from the combination whenever `d | cᵢ` — probability ~1/d,
+grindable in a handful of transcript attempts for d = 3. The G1 batch
+check (`zoda_kzg::eip4844::batch_subgroup_check_g1`) uses
+`cᵢ = 1 + h₁·kᵢ` (kᵢ 128-bit random): the `≡ 1 (mod h₁)` structure
+guarantees every h₁-order component contributes itself, coefficients stay
+~254 bits (h₁ ≈ 2^126), and one Pippenger MSM plus one full
+multiplication replaces n individual `[r]P` checks (4.3x at n = 129). The
+G2 side keeps per-point checks: h₂ ≈ 2^507 would push 1 + h₂k coefficients
+to ~635 bits, costlier than the direct check.
+
 **Montgomery multiplication (CIOS).** All field elements are kept in
 Montgomery form x̄ = xR mod p; multiplication is the coarsely-integrated
 operand-scanning (CIOS) algorithm with a final conditional subtraction —
@@ -25,7 +115,7 @@ arbitrary (power-of-two sized) point sets in O(n log² n): build the
 product tree of (X − xᵢ), evaluate down with polynomial remainders,
 interpolate up with the Lagrange-merge `P_{S∪T} = P_S·Z_T + P_T·Z_S`.
 
-## BLS12-381 (zoda-bls)
+## BLS12-381 tower and pairing engine (base construction)
 
 **Tower.** Fp2 = Fp[u]/(u²+1), Fp6 = Fp2[v]/(v³−ξ) with ξ = 1+u,
 Fp12 = Fp6[w]/(w²−v). Karatsuba throughout; the Fp12 cyclotomic square is
@@ -191,6 +281,19 @@ length 8192 exist), while sparse operands (narrow weight-ω challenges,
 monomial evaluation points, scalars) stay on the zero-skipping
 schoolbook path with the sparser side driving the outer loop — three
 NTT passes cost more than they save below ≈ 3.5·log₂n nonzeros.
+
+## Parallel 2D fixpoint reconstruction (v1.3)
+
+`reconstruct_2d` runs each row/column pass of the product-code fixpoint in
+parallel: within a pass the lines are independent (a row's decodability
+depends only on its own cells), each worker owns a `LineDecoder` whose
+Lagrange-basis cache is keyed by presence pattern, and results merge in
+ascending line order with deterministic lowest-index error reporting. The
+final row+column projection verification runs on two threads with the same
+error precedence as the serial order. Measured 1.48x on 2 vCPU at 64x64
+with 60% cell loss; semantics (fixpoint rounds, stall guidance, error
+cases) are bit-identical to the serial path — the exact-stats regression
+tests pin this.
 
 ## 2D availability theory (zoda-das::availability)
 

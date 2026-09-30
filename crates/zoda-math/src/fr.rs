@@ -80,6 +80,51 @@ mod tests {
     }
 
     #[test]
+    fn mont_rt_matches_const_path() {
+        // The ADX/BMI2 clone must be semantically identical to the
+        // portable const path (same algorithm, different codegen).
+        let mut rng = crate::rng::ZodaRng::from_seed(*b"mont-rt-check-000000000000000000");
+        for _ in 0..500 {
+            let mut a = [0u64; 4];
+            let mut b = [0u64; 4];
+            for i in 0..4 {
+                a[i] = rng.next_u64();
+                b[i] = rng.next_u64();
+            }
+            // keep the top limb in range so values stay < 2^256 (they may
+            // exceed r — the field functions handle unreduced operands)
+            a[3] >>= 2;
+            b[3] >>= 2;
+            assert_eq!(Fr::mont_mul_rt(a, b), Fr::mont_mul(a, b));
+        }
+    }
+
+    #[test]
+    fn wide_mul_and_redc_match_mont_mul() {
+        // mul_wide followed by mont_reduce_wide is the lazy-reduction
+        // pipeline: it must agree exactly with the fused CIOS product.
+        let mut rng = crate::rng::ZodaRng::from_seed(*b"mont-wide-chk-000000000000000000");
+        for _ in 0..500 {
+            let mut a = [0u64; 4];
+            let mut b = [0u64; 4];
+            for i in 0..4 {
+                a[i] = rng.next_u64();
+                b[i] = rng.next_u64();
+            }
+            // REDC validity needs T = a·b < r·R; limbs < r guarantee that,
+            // and arbitrary < 2^256 products also satisfy it (r ~ 2^255,
+            // R = 2^256 -> r·R ~ 2^511 > any 2^512 product? no: bound is
+            // a·b < r·R; a,b < 2^256 gives a·b < 2^512 while r·R ~ 2^511,
+            // so clamp the top limbs to stay in the valid range).
+            a[3] &= 0x3fffffffffffffff;
+            b[3] &= 0x3fffffffffffffff;
+            let wide = Fr::mul_wide_rt(&a, &b);
+            assert_eq!(Fr::mont_reduce_wide_rt(&wide), Fr::mont_mul(a, b));
+            assert_eq!(Fr::mont_reduce_wide(&wide), Fr::mont_mul(a, b));
+        }
+    }
+
+    #[test]
     fn basic_arithmetic() {
         let a = from_int(7);
         let b = from_int(5);

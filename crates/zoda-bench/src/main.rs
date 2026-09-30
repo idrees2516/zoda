@@ -110,6 +110,130 @@ fn main() {
         let _ = g2p;
     }
 
+    // ---------------- GLV / endomorphism / batch verification ----------------
+    if filter.is_empty() || filter == "glv" {
+        use zoda_bls::g1::G1Projective;
+        use zoda_bls::g2::G2Projective;
+        let k = rng.next_fr(false);
+        let p1 = G1Projective::generator().mul_fr(&k).to_affine();
+        let q2 = G2Projective::generator().mul_fr(&k).to_affine();
+        results.push(bench("G1 scalar mul (plain, 255-bit)", "reference path", 50, || {
+            p1.to_projective().mul_fr(&k)
+        }));
+        results.push(bench("G1 scalar mul (GLV 2-dim)", "public points", 50, || {
+            zoda_bls::endomorphism::mul_g1_public(&p1.to_projective(), &k)
+        }));
+        results.push(bench("G2 scalar mul (plain, 255-bit)", "reference path", 20, || {
+            q2.to_projective().mul_fr(&k)
+        }));
+        results.push(bench("G2 scalar mul (GLV 2-dim)", "public points", 20, || {
+            zoda_bls::endomorphism::mul_g2_public(&q2.to_projective(), &k)
+        }));
+        results.push(bench("hash_to_curve G2 (psi-chain cofactor)", "RFC 9380 RO suite", 50, || {
+            zoda_bls::hash::hash_to_curve_g2(b"glv bench message", zoda_bls::sig::DST)
+        }));
+        // G1 subgroup checks at the verify_cell_kzg_proof_batch scale
+        let pts: Vec<zoda_bls::g1::G1Affine> = (0..129usize)
+            .map(|i| G1Projective::generator().mul_limbs(&[(i + 1) as u64, 0x9e37, 0, 0]).to_affine())
+            .collect();
+        results.push(bench("G1 subgroup check x129 (individual)", "pre-v1.3 path", 3, || {
+            pts.iter().all(|p| zoda_bls::endomorphism::subgroup_check_g1(p))
+        }));
+        results.push(bench("G1 subgroup check x129 (batched MSM)", "edas verify path", 20, || {
+            zoda_kzg::eip4844::batch_subgroup_check_g1(&pts)
+        }));
+        // batch BLS verification
+        let items: Vec<(zoda_bls::PublicKey, Vec<u8>, zoda_bls::Signature)> = (0..16usize)
+            .map(|i| {
+                let sk = zoda_bls::SecretKey::from_seed(format!("glv bench key {}", i).as_bytes());
+                let pk = sk.public_key();
+                let msg = format!("glv bench message {}", i).into_bytes();
+                let sig = sk.sign(&msg);
+                (pk, msg, sig)
+            })
+            .collect();
+        let refs: Vec<(&zoda_bls::PublicKey, &[u8], &zoda_bls::Signature)> = items
+            .iter()
+            .map(|(p, m, s)| (p, m.as_slice(), s))
+            .collect();
+        results.push(bench("BLS verify x16 (individual)", "reference", 2, || {
+            refs.iter().all(|(p, m, s)| zoda_bls::verify(p, m, s))
+        }));
+        results.push(bench("BLS verify_batch x16", "1 final exp amortised", 3, || {
+            zoda_bls::verify_batch(&refs)
+        }));
+        results.push(bench("BLS verify_batch_strict x16", "batch subgroup + GLV", 3, || {
+            zoda_bls::verify_batch_strict(&refs)
+        }));
+    }
+
+    // ---------------- EigenDA-style batch pipeline throughput ----------------
+    if filter.is_empty() || filter == "eigenda" {
+        println!("building KZG test setup (4096-point, deterministic tau)…");
+        let t0 = Instant::now();
+        let setup = zoda_kzg::srs::Setup::from_seed_for_testing(*b"bench-eigenda-tau-00000000000000");
+        println!("  setup built in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
+        const NBLOBS: usize = 8; // 1 MiB batch (EigenDA-style operator duty)
+        let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(NBLOBS);
+        for _ in 0..NBLOBS {
+            let mut b = vec![0u8; 131072];
+            rng.next_bytes(&mut b);
+            for chunk in b.chunks_exact_mut(32) {
+                chunk[0] &= 0x3f;
+            }
+            blobs.push(b);
+        }
+        // commit phase
+        let t0 = Instant::now();
+        let comms: Vec<[u8; 48]> = blobs
+            .iter()
+            .map(|b| zoda_kzg::eip4844::blob_to_kzg_commitment(b, &setup).unwrap())
+            .collect();
+        let commit_s = t0.elapsed().as_secs_f64();
+        // extend + FK20 prove phase
+        let t0 = Instant::now();
+        let mut all_cells: Vec<zoda_edas::Cell> = Vec::with_capacity(NBLOBS * 128);
+        let mut all_proofs: Vec<[u8; 48]> = Vec::with_capacity(NBLOBS * 128);
+        let mut all_indices: Vec<u64> = Vec::with_capacity(NBLOBS * 128);
+        let mut all_comms: Vec<&[u8]> = Vec::with_capacity(NBLOBS * 128);
+        for (i, b) in blobs.iter().enumerate() {
+            let (cells, proofs) = zoda_edas::compute_cells_and_kzg_proofs(b, &setup).unwrap();
+            for (ci, (cell, proof)) in cells.into_iter().zip(proofs.into_iter()).enumerate() {
+                all_cells.push(cell);
+                all_proofs.push(proof);
+                all_indices.push(ci as u64);
+                all_comms.push(&comms[i]);
+            }
+        }
+        let prove_s = t0.elapsed().as_secs_f64();
+        // batch verify phase (attester duty)
+        let t0 = Instant::now();
+        let proof_refs: Vec<&[u8]> = all_proofs.iter().map(|p| p.as_slice()).collect();
+        let ok = zoda_edas::verify_cell_kzg_proof_batch(
+            &all_comms,
+            &all_indices,
+            &all_cells,
+            &proof_refs,
+            &setup,
+        )
+        .unwrap();
+        let verify_s = t0.elapsed().as_secs_f64();
+        assert!(ok, "eigenda pipeline verification failed");
+        let total_s = commit_s + prove_s + verify_s;
+        let mib = (NBLOBS as f64) * 131072.0 / 1_048_576.0;
+        println!();
+        println!("  EigenDA-style batch pipeline ({} blobs, {:.0} MiB):", NBLOBS, mib);
+        println!("    commit (blob->KZG)        {:>8.1} ms   {:.2} MB/s", commit_s * 1e3, mib * 1_048_576.0 / commit_s / 1e6);
+        println!("    extend + FK20 prove       {:>8.1} ms   {:.2} MB/s", prove_s * 1e3, mib * 1_048_576.0 / prove_s / 1e6);
+        println!("    batch verify ({} cells) {:>8.1} ms   {:.2} MB/s", all_cells.len(), verify_s * 1e3, mib * 1_048_576.0 / verify_s / 1e6);
+        println!("    end-to-end                {:>8.1} ms   {:.2} MB/s", total_s * 1e3, mib * 1_048_576.0 / total_s / 1e6);
+        results.push(Timed {
+            name: format!("eigenda pipeline ({} blobs e2e)", NBLOBS),
+            ns: (total_s * 1e9) as u128,
+            note: format!("{:.2} MB/s end-to-end", mib * 1_048_576.0 / total_s / 1e6),
+        });
+    }
+
     // ---------------- KZG / EIP-4844 ----------------
     if filter.is_empty() || filter == "kzg" {
         println!("building KZG test setup (4096-point, deterministic tau)…");
@@ -127,8 +251,11 @@ fn main() {
         }));
         let comm = zoda_kzg::eip4844::blob_to_kzg_commitment(&blob, &setup).unwrap();
         results.push(bench("compute_kzg_proof", "quotient + MSM", 20, || {
-            let mut z = [0u8; 32];
-            z.copy_from_slice(&x.to_le_bytes());
+            let le = x.to_le_bytes();
+            let mut z = [0u8; 32]; // z is I2OSP'd big-endian
+            for i in 0..32 {
+                z[i] = le[31 - i];
+            }
             x = x + Fr::ONE;
             zoda_kzg::eip4844::compute_kzg_proof(&blob, &z, &setup)
         }));

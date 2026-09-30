@@ -480,15 +480,23 @@ pub fn verify_cell_kzg_proof_batch(
         v
     };
 
-    // Parse points
+    // Parse points (subgroup checks are aggregated below: one MSM and a
+    // single [r]S multiplication replace n individual [r]P checks)
     let proofs_g1: Vec<G1Affine> = proofs
         .iter()
-        .map(|p| zoda_kzg::eip4844::bytes_to_kzg_proof(p))
+        .map(|p| zoda_kzg::eip4844::parse_g1_canonical(p))
         .collect::<Result<_, _>>()?;
     let commitments_g1: Vec<G1Affine> = unique
         .iter()
-        .map(|c| zoda_kzg::eip4844::bytes_to_kzg_commitment(c))
+        .map(|c| zoda_kzg::eip4844::parse_g1_canonical(c))
         .collect::<Result<_, _>>()?;
+    {
+        let mut all = commitments_g1.clone();
+        all.extend_from_slice(&proofs_g1);
+        if !zoda_kzg::eip4844::batch_subgroup_check_g1(&all) {
+            return Err("G1 point not in subgroup".to_string());
+        }
+    }
 
     // proof_lincomb = Σ r^i π_i
     let proof_lincomb = zoda_kzg::msm::g1_lincomb(&proofs_g1, &r_powers);

@@ -33,7 +33,6 @@ use crate::encode::Matrix;
 use crate::params::{ZodaParams, ZodaPublic};
 use crate::sample::{verify_column_sample, verify_row_sample};
 use std::collections::HashMap;
-use std::rc::Rc;
 use zoda_math::{batch_invert, FftDomain, Fr, PrimeField};
 
 /// A partially received `rows × cols` grid: values plus a presence bitmap.
@@ -286,52 +285,76 @@ pub fn reconstruct_2d(
         ));
     }
     let mut stats = ReconStats::default();
-    let mut row_decoder = LineDecoder::new(&params.row_domain, params.k);
-    let mut col_decoder = LineDecoder::new(&params.col_domain, params.m);
+    // Worker count for the parallel line passes: each worker owns a
+    // LineDecoder (the Lagrange-basis cache is per-worker; bases are
+    // keyed by presence pattern, so duplication across workers is
+    // bounded by the number of distinct patterns).
+    let workers = std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(1)
+        .min(rows.max(cols).max(1));
+    let mut row_decoders: Vec<LineDecoder> = (0..workers)
+        .map(|_| LineDecoder::new(&params.row_domain, params.k))
+        .collect();
+    let mut col_decoders: Vec<LineDecoder> = (0..workers)
+        .map(|_| LineDecoder::new(&params.col_domain, params.m))
+        .collect();
 
     loop {
         let mut changed = false;
         stats.rounds += 1;
-        // ---- row pass: rows with ≥ k present cells and at least one gap
-        for r in 0..rows {
-            let present = partial.row_present(r);
-            if present < params.k || present == cols {
-                continue;
-            }
-            let (idx, vals) = partial.row_cells(r);
-            match row_decoder.decode(&idx, &vals) {
-                Ok(full) => {
-                    for c in 0..cols {
-                        if !partial.is_present(r, c) {
-                            partial.insert_cell(r, c, full[c]);
-                            stats.cells_recovered += 1;
-                            changed = true;
+        // ---- row pass: rows with ≥ k present cells and at least one gap.
+        // Rows are independent within a pass (a row's decodability depends
+        // only on its own cells), so they decode in parallel exactly.
+        let decodable: Vec<usize> = (0..rows)
+            .filter(|&r| {
+                let present = partial.row_present(r);
+                present >= params.k && present != cols
+            })
+            .collect();
+        if !decodable.is_empty() {
+            match decode_lines_parallel(&decodable, &mut row_decoders, |r| {
+                partial.row_cells(r)
+            }) {
+                Ok(recovered) => {
+                    for (r, full) in recovered {
+                        for c in 0..cols {
+                            if !partial.is_present(r, c) {
+                                partial.insert_cell(r, c, full[c]);
+                                stats.cells_recovered += 1;
+                                changed = true;
+                            }
                         }
+                        stats.rows_decoded += 1;
                     }
-                    stats.rows_decoded += 1;
                 }
-                Err(_) => return Err(ReconError::CorruptRow(r)),
+                Err(r) => return Err(ReconError::CorruptRow(r)),
             }
         }
-        // ---- column pass
-        for c in 0..cols {
-            let present = partial.col_present(c);
-            if present < params.m || present == rows {
-                continue;
-            }
-            let (idx, vals) = partial.col_cells(c);
-            match col_decoder.decode(&idx, &vals) {
-                Ok(full) => {
-                    for r in 0..rows {
-                        if !partial.is_present(r, c) {
-                            partial.insert_cell(r, c, full[r]);
-                            stats.cells_recovered += 1;
-                            changed = true;
+        // ---- column pass (columns are independent within the pass)
+        let decodable: Vec<usize> = (0..cols)
+            .filter(|&c| {
+                let present = partial.col_present(c);
+                present >= params.m && present != rows
+            })
+            .collect();
+        if !decodable.is_empty() {
+            match decode_lines_parallel(&decodable, &mut col_decoders, |c| {
+                partial.col_cells(c)
+            }) {
+                Ok(recovered) => {
+                    for (c, full) in recovered {
+                        for r in 0..rows {
+                            if !partial.is_present(r, c) {
+                                partial.insert_cell(r, c, full[r]);
+                                stats.cells_recovered += 1;
+                                changed = true;
+                            }
                         }
+                        stats.cols_decoded += 1;
                     }
-                    stats.cols_decoded += 1;
                 }
-                Err(_) => return Err(ReconError::CorruptColumn(c)),
+                Err(c) => return Err(ReconError::CorruptColumn(c)),
             }
         }
         if !changed {
@@ -341,25 +364,51 @@ pub fn reconstruct_2d(
             // defensive: cannot happen for genuine tensor codewords
             break;
         }
-    }
-
-    if !partial.is_complete() {
+    }    if !partial.is_complete() {
         let fetch_next =
             partial.next_cells_to_fetch(params.k, params.m, 4 * params.k.max(params.m));
         return Err(ReconError::Incomplete { stats, fetch_next });
     }
 
     // ---- final binding: every line must satisfy the public projections.
+    // The checks are pure functions of the matrix, so rows and columns
+    // verify in parallel (error precedence matches the serial order:
+    // lowest failing row first, then lowest failing column).
     let matrix = partial.to_matrix();
-    for r in 0..rows {
-        if let Err(e) = verify_row_sample(public, r, matrix.row_slice(r)) {
-            return Err(ReconError::ProjectionMismatch(format!("row {}: {}", r, e)));
-        }
+    let parallel = rows + cols >= 64
+        && std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1) > 1;
+    let (row_err, col_err) = if parallel {
+        let m = &matrix;
+        let (rres, cres) = std::thread::scope(|scope| {
+            let hr = scope.spawn(move || {
+                (0..rows)
+                    .map(|r| verify_row_sample(public, r, m.row_slice(r)))
+                    .collect::<Vec<_>>()
+            });
+            let hc = scope.spawn(move || {
+                (0..cols)
+                    .map(|c| verify_column_sample(public, c, &m.col(c)))
+                    .collect::<Vec<_>>()
+            });
+            let rres = hr.join().expect("row verify thread panicked");
+            let cres = hc.join().expect("col verify thread panicked");
+            (rres, cres)
+        });
+        (
+            rres.into_iter().enumerate().find(|(_, v)| v.is_err()),
+            cres.into_iter().enumerate().find(|(_, v)| v.is_err()),
+        )
+    } else {
+        (
+            (0..rows).map(|r| (r, verify_row_sample(public, r, matrix.row_slice(r)))).find(|(_, v)| v.is_err()),
+            (0..cols).map(|c| (c, verify_column_sample(public, c, &matrix.col(c)))).find(|(_, v)| v.is_err()),
+        )
+    };
+    if let Some((r, Err(e))) = row_err {
+        return Err(ReconError::ProjectionMismatch(format!("row {}: {}", r, e)));
     }
-    for c in 0..cols {
-        if let Err(e) = verify_column_sample(public, c, &matrix.col(c)) {
-            return Err(ReconError::ProjectionMismatch(format!("column {}: {}", c, e)));
-        }
+    if let Some((c, Err(e))) = col_err {
+        return Err(ReconError::ProjectionMismatch(format!("column {}: {}", c, e)));
     }
     Ok(stats)
 }
@@ -390,19 +439,78 @@ pub fn verify_codeword(matrix: &Matrix, params: &ZodaParams, public: &ZodaPublic
     Ok(())
 }
 
+/// Decode `lines` (indices into the grid, ascending) with one
+/// worker-owned `LineDecoder` per thread. Within a single pass the lines
+/// are independent, so this is an exact parallelisation. Returns the
+/// decoded lines in ascending order, or the lowest corrupt index.
+fn decode_lines_parallel(
+    lines: &[usize],
+    decoders: &mut [LineDecoder],
+    get_cells: impl Fn(usize) -> (Vec<usize>, Vec<Fr>) + Sync,
+) -> Result<Vec<(usize, Vec<Fr>)>, usize> {
+    let nworkers = decoders.len().max(1);
+    if lines.len() < 4 || nworkers == 1 {
+        // serial path: one decoder, in order
+        let dec = &mut decoders[0];
+        let mut out = Vec::with_capacity(lines.len());
+        for &l in lines {
+            let (idx, vals) = get_cells(l);
+            match dec.decode(&idx, &vals) {
+                Ok(full) => out.push((l, full)),
+                Err(_) => return Err(l),
+            }
+        }
+        return Ok(out);
+    }
+    let per = (lines.len() + nworkers - 1) / nworkers;
+    let mut results: Vec<Result<Vec<(usize, Vec<Fr>)>, usize>> = Vec::with_capacity(nworkers);
+    let line_chunks: Vec<&[usize]> = lines.chunks(per).collect();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(line_chunks.len());
+        // iter_mut yields disjoint &mut decoders, one per spawned thread
+        for (chunk, dec) in line_chunks.iter().zip(decoders.iter_mut()) {
+            let chunk = *chunk;
+            let get = &get_cells;
+            handles.push(scope.spawn(move || {
+                let mut out = Vec::with_capacity(chunk.len());
+                for &l in chunk {
+                    let (idx, vals) = get(l);
+                    match dec.decode(&idx, &vals) {
+                        Ok(full) => out.push((l, full)),
+                        Err(_) => return Err(l),
+                    }
+                }
+                Ok(out)
+            }));
+        }
+        for h in handles {
+            results.push(h.join().expect("decode thread panicked"));
+        }
+    });
+    // merge in chunk order == ascending line order; report the lowest corrupt
+    let mut out = Vec::with_capacity(lines.len());
+    for r in results {
+        match r {
+            Ok(mut v) => out.append(&mut v),
+            Err(l) => return Err(l),
+        }
+    }
+    Ok(out)
+}
+
 /// One line (row or column) interpolator with a basis cache keyed by the
 /// presence pattern: rows sharing the same available columns reuse the
 /// O(k²) Lagrange basis.
 struct LineDecoder {
     domain: FftDomain<Fr>,
     k: usize,
-    cache: HashMap<Vec<u64>, Rc<Vec<Vec<Fr>>>>,
+    cache: HashMap<Vec<u64>, std::sync::Arc<Vec<Vec<Fr>>>>,
 }
 
 impl LineDecoder {
     fn new(domain: &FftDomain<Fr>, k: usize) -> LineDecoder {
         LineDecoder {
-            domain: FftDomain::new(domain.size()),
+            domain: domain.clone(),
             k,
             cache: HashMap::new(),
         }
@@ -427,7 +535,7 @@ impl LineDecoder {
             Some(b) => b.clone(),
             None => {
                 let xs: Vec<Fr> = use_idx.iter().map(|&i| roots[i]).collect();
-                let b = Rc::new(lagrange_basis(&xs, &self.domain));
+                let b = std::sync::Arc::new(lagrange_basis(&xs, &self.domain));
                 self.cache.insert(key, b.clone());
                 b
             }
