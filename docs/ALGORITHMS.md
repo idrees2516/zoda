@@ -87,19 +87,34 @@ normalization — the FK20 transform backbone.
 
 ## ZODA tensor code (zoda-core)
 
-**Systematic RS on the roots domain.** Data occupies the first k of 2k
-domain points: interpolate, then evaluate (one NTT). The interpolation
-nodes {ωⁱ} are a **geometric sequence**, so the transposed-Vandermonde
-identity applies: with cached barycentric weights wᵢ = 1/Z'(ωⁱ) and the
-cached Q(t) = Πⱼ(1 − ω^j t), each vector's monomial coefficients are
-cₖ = Σ_a Q_a·β_{n−1−k−a} from the u-weighted power sums
-βₘ = Σᵢ uᵢω^{im} (u = w ⊙ data) — no subproduct tree, no per-vector
-allocations, ~10x faster at k = 64. The row and column passes run in
-parallel across cores.
+**Systematic RS on the roots domain — O(n log n).** Data occupies the
+first k of 2k domain points: interpolate, then evaluate (one NTT). The
+interpolation nodes {ωⁱ} are a **geometric sequence**, so the
+transposed-Vandermonde identity applies: with cached barycentric weights
+wᵢ = 1/Z'(ωⁱ) and the cached Q(t) = Πⱼ(1 − ω^j t), each vector's
+monomial coefficients are cₖ = Σ_a Q_a·β_{n−1−k−a} from the u-weighted
+power sums βₘ = Σᵢ uᵢω^{im} (u = w ⊙ data). Both quadratic kernels of
+that identity collapse into butterfly transforms:
+
+* βₘ = Σᵢ uᵢω^{im} is *literally* the m-th output of the size-2n NTT of
+  u — one transform replaces the n² power-sum loop;
+* cₖ = R[n−1−k] where R = Q·B is an **exact** product (deg Q + deg B =
+  n + (n−1) = 2n−1, so a size-2n cyclic convolution has no wraparound):
+  NTT(Q) is cached per domain size, NTT(B) is the second transform, one
+  INTT recovers R.
+
+Three size-2n transforms per vector plus the final evaluation NTT —
+measured **49x over the schoolbook loops at n = 1024** (59 ms → 1.2 ms),
+with the crossover at n ≈ 40 (below it the schoolbook loops win and are
+used). The row and column passes run in parallel across cores.
 
 **Tensor encoding.** Extend all rows (m×k → m×2k), then all columns
 (→ 2m×2k). By linearity every row of the result is a column-code
-codeword and every column a row-code codeword.
+codeword and every column a row-code codeword. The column pass runs in
+a **transposed layout** on large grids: a blocked 32×32 transpose makes
+every column a contiguous row, the encodes stream, and a second
+transpose restores the orientation — two linear cache-friendly passes
+instead of one cache miss per matrix element.
 
 **Zero-overhead sampling.** Let Z be the tensor codeword and g_r, g_r2
 random vectors (Fiat–Shamir from the Merkle roots). The prover publishes
@@ -109,11 +124,26 @@ analogously. A forged row can only pass if it matches the projection of
 the committed row — probability 1/|F| per forgery attempt after the
 commitments fix g_r.
 
-**Reconstruction.** Any k of the 2k evaluations of a degree-<k polynomial
-determine it. All rows share the same erasure nodes, so the **Lagrange
-basis is built once** (synthetic division of the shared vanishing
-polynomial + one batch inversion) and every row reduces to an O(k²)
-weighted sum of the basis before a single re-evaluation NTT.
+**Reconstruction (full columns).** Any k of the 2k evaluations of a
+degree-<k polynomial determine it. All rows share the same erasure
+nodes, so the **Lagrange basis is built once** (synthetic division of
+the shared vanishing polynomial + one batch inversion) and every row
+reduces to an O(k²) weighted sum of the basis before a single
+re-evaluation NTT.
+
+**2D erasure decoding (arbitrary cell loss).** `reconstruct_2d` runs the
+classical product-code fixpoint: every row with ≥ k of 2k cells present
+is interpolated (from its first k cells) and filled; every column with
+≥ m of 2m cells likewise; repeat until a full pass recovers nothing.
+Rows sharing an availability pattern reuse the cached O(k²) Lagrange
+basis (keyed by the presence bitmask). Security: every decoded line is
+**checked against all its remaining present cells** (a tampered cell
+fails closed with its index), and the completed grid is verified line
+by line against the public Fiat–Shamir projections — catching the
+consistent-but-wrong decodings (exactly-k adversarial cells) that no
+re-encoding check can detect. On a stall the decoder reports the cells
+whose fetch would unlock the closest-to-decodable line
+(`next_cells_to_fetch`).
 
 ## EIP-7594 cells + FK20 (zoda-edas)
 
@@ -162,11 +192,68 @@ monomial evaluation points, scalars) stay on the zero-skipping
 schoolbook path with the sparser side driving the outer loop — three
 NTT passes cost more than they save below ≈ 3.5·log₂n nonzeros.
 
-## Sampling statistics (zoda-das / zoda-rda)
+## 2D availability theory (zoda-das::availability)
 
-Distinct (without-replacement) draws per session: the probability that a
-specific hidden row of n escapes k distinct samples is exactly
-C(n−1,k)/C(n,k) = Πᵢ (n−1−i)/(n−i) — computed in floating point and
-saturated to 0 at k = n. Sampling plans solve for the smallest k meeting
-a target miss probability; the adaptive session accumulates confidence
-across rounds with early exit.
+**The minimal withholding set.** The 2m×2k tensor code has minimum
+distance (m+1)(k+1) (product-code distance = d_row·d_col). Nothing
+smaller can be ambiguous. Conversely, minimum-weight RS codewords
+vanish at *any* chosen k−1 of the 2k domain points (degree-(k−1)
+polynomials with prescribed roots), so their outer products are tensor
+codewords whose supports are **(m+1)×(k+1) rectangles** — hiding such a
+rectangle always leaves two codewords consistent with everything
+available. The adversary's optimal strategy is therefore exactly a
+rectangle, and every bound below is exact, not heuristic.
+
+* **Cell sampling**: s uniform distinct cells of the 4mk grid escape the
+  rectangle with probability C(4mk−(m+1)(k+1), s)/C(4mk, s)
+  (hypergeometric, evaluated in log space). A 128×128 grid needs 95
+  cell samples for 2⁻⁴⁰.
+* **Line sampling (ZODA)**: hiding the rectangle means refusing m+1
+  rows AND k+1 columns; u_r row draws and u_c column draws all miss
+  with probability the product of the two hypergeometric tails
+  C(2m−(m+1), u_r)/C(2m, u_r) · C(2k−(k+1), u_c)/C(2k, u_c).
+* **EIP-7594 blob grids**: a blob is ambiguous only when ≥ 65 of its
+  128 cells are hidden (65·64 = 4160 > 4095 evaluations); column
+  sampling detects it unless every sampled column avoids the hidden
+  ones — C(63, s)/C(128, s) ≈ 2⁻⁸·⁵ at the spec's 8 samples per slot.
+
+`log_binomial` uses an exact product (not Stirling-series differences)
+for min(k, n−k) ≤ 1024: the cancellation-free form keeps hypergeometric
+*ratios* accurate to ~1e-15, which the confidence machinery depends on.
+
+## Sampling engines (zoda-das)
+
+**Attested line sessions** (`run_attested_session`): adaptive rounds of
+row/column draws (custody columns scheduled first, then uniform undrawn
+indices), round-robin routed across a peer set with per-peer
+scorecards. Every fetched line carries its **Merkle inclusion proof**:
+the projection check binds the line to the Fiat–Shamir challenges, the
+Merkle proof binds it to the committed root — together they make
+cross-grid replay and forgery both fail closed. Verdicts are exact:
+`Available` (escape bound ≤ target), `Rejected` (any sample failed),
+`Insufficient` (budget exhausted, achieved confidence reported).
+
+**Cell sessions over blob grids** (`sample_cell_session`): the Fulu
+2D layout — each blob is a 128-cell row, columns are cell indices
+across all blobs. Rounds draw columns (custody-first), fetch every
+blob's cell in each drawn column with its FK20 proof, and batch-verify
+the whole round with a **single pairing** (`verify_cell_kzg_proof_batch`,
+with a bisection fallback that pinpoints the bad cell if the batch
+fails). Per-blob and per-column custody counters accumulate for
+reconstruction readiness.
+
+## Custody storage (zoda-archival)
+
+Verify-on-insert everywhere (projection check for ZODA columns, batch
+cell-proof verification for EIP-7594 columns). Reconstruction
+**persists its result**: recovered columns are re-verified then stored,
+so custody only ever contains lines bound to the commitment. The
+compact file format is self-describing and self-verifying: header
+(grid id, shape, the full public verification parameters), an
+availability bitfield, raw 32-byte field elements of exactly the
+present columns, and a trailing SHA-256. `DiskCustody` writes
+atomically (temp + fsync + rename); `CustodyStore` enforces byte
+budgets by evicting oldest-slot grids. The EIP-7594 equivalent
+(`CellCustody`) stores per-blob (cell, proof) pairs per column with
+the same discipline — 2104 bytes per custodied column-blob slot, no
+framing overhead.

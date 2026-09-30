@@ -33,13 +33,16 @@ crates/
 ├── zoda-bls       BLS12-381: Fp2/Fp6/Fp12 tower, G1/G2, optimal ate pairing, RFC 9380
 │                  hash-to-curve, BLS signatures — zero dependencies
 ├── zoda-kzg       EIP-4844 evaluation-form KZG, trusted setup (mainnet format), Pippenger MSM
-├── zoda-core      ZODA tensor protocol: NTT encoding, commitments, sample proofs, reconstruction
+├── zoda-core      ZODA tensor protocol: O(n log n) encoding, commitments, sample
+│                  proofs, full-column + arbitrary-cell 2D reconstruction
 ├── zoda-pq        lattice post-quantum polynomial commitments (Module-LWE/SIS, BDLOP + Lyubashevsky)
 ├── zoda-edas      EIP-7594: DAS extension, 128 cells, FK20 proofs, batch verify, recovery, custody
-├── zoda-das       sampling plans and sessions over the tensor code
+├── zoda-das       2D sampling: exact availability theory, attested multi-peer line
+│                  sessions, EIP-7594 cell sessions with column custody
 ├── zoda-sybils    BLS sortition, stake-weighted selection, peer scoring
 ├── zoda-rda       adaptive randomized-DA sessions with confidence accounting
-├── zoda-archival  column custody store + reconstruction service
+├── zoda-archival  custody storage: verify-on-insert, persisting reconstruction,
+│                  compact checksummed files, atomic disk writes, budget pruning
 ├── zoda-bridges   light-client inclusion proofs, KZG-backed bridge messages
 ├── zoda-ethrex    ethrex-compatible blob-transaction sidecars
 ├── zoda           facade re-exporting the whole stack
@@ -49,7 +52,7 @@ crates/
 ## Quick start
 
 ```bash
-cargo test --workspace --release    # ~120 tests, incl. official RFC/Ethereum vectors
+cargo test --workspace --release    # 159 tests incl. 320 official spec vectors (when fetched)
 cargo run --release -p zoda-bench  # full benchmark table
 ```
 
@@ -109,19 +112,23 @@ assert!(zoda::pq::LatticePcs::verify(&params, &com, &zeta, &v, &proof));
 
 | operation | time | vs v1.0.0 |
 |---|---|---|
-| `Fr` multiplication | **22 ns** | — |
-| NTT-8192 | 1.8 ms | — |
-| pairing (Miller + fountain final exp) | 1.57 ms | — |
-| BLS verify (2 pairings) | 3.4 ms | 1.1x |
-| `blob_to_kzg_commitment` (4096 MSM) | 65 ms | **5.6x** |
+| `Fr` multiplication | **25 ns** | — |
+| NTT-8192 | 1.9 ms | — |
+| pairing (Miller + fountain final exp) | 2.0 ms | — |
+| BLS verify (2 pairings) | 4.1 ms | 1.1x |
+| `blob_to_kzg_commitment` (4096 MSM) | 69 ms | **5.6x** |
 | ZODA verify row sample (64×64 grid) | **2.6 µs** | — |
-| ZODA commit (64×64 grid) | 39 ms | **6.6x** |
+| ZODA commit (64×64 grid) | **15.5 ms** | **16.5x** |
 | ZODA reconstruct (32 of 64 columns) | 2.4 ms | **14.7x** |
+| RS interpolation kernel (n = 1024) | **1.2 ms** | **49x vs the O(n²) loops** |
+| `reconstruct_2d` 64×64, 60% cells erased | 16 ms | new: arbitrary cell loss + full verify |
+| attested DAS session (16×16, 1 peer) | **438 µs** | new: projections + Merkle + peer scores |
+| custody ingest (verified column) | 297 µs | new |
 | `compute_cells` (EIP-7594) | 2.9 ms | 1.2x |
 | FK20 (128 cell proofs) | 0.31 s | **6.0x** |
 | `verify_cell_kzg_proof_batch` (128 cells) | 49 ms† | 1.7x† |
 | recover 64→128 cells | 0.28 s | **6.6x** |
-| PQ commit / open / verify (L1) | 5.2 / 13 / 13 ms | **9.5 / 4.6 / 3.0x** |
+| PQ commit / open / verify (L1) | 5.3 / 13 / 13 ms | **9.5 / 4.6 / 3.0x** |
 
 † now includes the spec-mandated subgroup validation of all 129 parsed
 points (~24 ms on this stack); excluding it the batch check runs in

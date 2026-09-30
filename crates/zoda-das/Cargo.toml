@@ -8,3 +8,5 @@ description = "Data availability sampling: adaptive sampling plans, success prob
 [dependencies]
 zoda-math = { path = "../zoda-math" }
 zoda-core = { path = "../zoda-core" }
+zoda-kzg = { path = "../zoda-kzg" }
+zoda-edas = { path = "../zoda-edas" }

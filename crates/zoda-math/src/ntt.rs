@@ -45,6 +45,7 @@ impl FftField for crate::Fq {
 pub struct FftDomain<F: FftField> {
     /// transform size
     pub n: usize,
+    #[allow(dead_code)]
     log_n: u32,
     /// per-stage twiddles: `stage_twiddles[s][j] = ω_{2^{s+1}}^j`
     /// laid out contiguously in one vector; stage s occupies

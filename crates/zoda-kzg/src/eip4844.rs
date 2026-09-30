@@ -307,6 +307,7 @@ pub fn verify_kzg_proof_impl(
 }
 
 use zoda_bls::g2::G2Projective as G2P2;
+#[allow(non_snake_case)]
 fn G2ProjectiveGen() -> G2P2 {
     G2P2::generator()
 }

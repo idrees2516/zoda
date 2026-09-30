@@ -80,7 +80,7 @@ fn sponge(data: &[u8], rate: usize, pad_byte: u8, out_len: usize) -> Vec<u8> {
     let mut st = [0u64; 25];
     let mut offset = 0;
     // absorb full blocks
-    let mut process_block = |st: &mut [u64; 25], block: &[u8]| {
+    let process_block = |st: &mut [u64; 25], block: &[u8]| {
         for (i, chunk) in block.chunks_exact(8).enumerate() {
             st[i] ^= u64::from_le_bytes(chunk.try_into().unwrap());
         }

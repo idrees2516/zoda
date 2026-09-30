@@ -8,7 +8,7 @@
 * Harness: `cargo run --release -p zoda-bench` — warm-up pass, then the
   mean over the listed iteration count (deterministic seeded inputs; no
   OS entropy in the measurements).
-* Filter with `zoda-bench math`, `bls`, `kzg`, `edas`, `core` or
+* Filter with `zoda-bench math`, `bls`, `kzg`, `edas`, `core`, `das2d` or
   `pq` to run a single group.
 * KZG/EDAS runs use a deterministic 4096-point toy setup (`tau` from a
   seed; the mainnet setup file yields the same shapes — point counts and
@@ -19,6 +19,75 @@
   of every parsed G1 point (`[r]P = O`, matching c-kzg's
   `validate_kzg_g1`) — roughly 0.19 ms per commitment/proof on this
   pure-Rust stack.
+
+## Results (v1.2.0 — 2D DAS + erasure-coding deep dive)
+
+New this release: the O(n log n) RS interpolation kernel (both quadratic
+loops of the transposed-Vandermonde identity became butterfly
+transforms), the transposed cache-friendly column encode, the 2D
+scattered-erasure fixpoint decoder, attested multi-peer sampling
+sessions, cell-level blob-grid sessions, and the custody storage layer.
+
+```
+====================================================================================================
+BENCHMARK                                                          TIME       UNIT   NOTES
+====================================================================================================
+Fr mul (Montgomery, 4 limbs)                                      0.025         µs   field core [1000000 iters]
+Fr invert (Fermat)                                                7.324         µs   batch-invert backbone [500 iters]
+NTT size 4096                                                   910.376         µs   262.14 KB/s/iter [200 iters]
+NTT size 8192                                                  1951.490         µs   524.29 KB/s/iter [200 iters]
+G1 scalar mul (windowed, 255-bit)                               215.784         µs   sign/pk path [50 iters]
+BLS sign (hash_to_curve G2 + mul)                              2125.106         µs   ETH2 ciphersuite [20 iters]
+BLS verify (2 pairings)                                        4085.512         µs   ETH2 ciphersuite [10 iters]
+pairing e(g1, g2) (miller + final exp)                         2014.090         µs   fountain chain [10 iters]
+blob_to_kzg_commitment (4096 MSM)                             69009.346         µs   EIP-4844 hot path [20 iters]
+compute_kzg_proof                                             24505.301         µs   quotient + MSM [20 iters]
+verify_kzg_proof (single)                                      3231.029         µs   2 pairings [20 iters]
+verify_blob_kzg_proof_batch (6 blobs)                         15469.866         µs   3 MSM + 1 pairing [10 iters]
+compute_cells (FFT 8192 + BRP)                                 2924.138         µs   EIP-7594 extension [20 iters]
+compute_cells_and_kzg_proofs (FK20)                          279098.129         µs   128 cell proofs, O(n log n) [5 iters]
+verify_cell_kzg_proof_batch (128 cells)                       48751.942         µs   1 pairing amortised [5 iters]
+recover_cells_and_kzg_proofs (from 64)                       278123.319         µs   erasure decode + FK20 [3 iters]
+ZODA commit (16x16 grid, full encode)                          2194.321         µs   2x NTT passes + Merkle + FS [5 iters]
+ZODA verify row sample (16x16)                                    0.693         µs   O(2k) inner product [100 iters]
+ZODA commit (64x64 grid, full encode)                         15454.741         µs   2x NTT passes + Merkle + FS [5 iters]
+ZODA verify row sample (64x64)                                    2.567         µs   O(2k) inner product [100 iters]
+ZODA reconstruct from 32 cols (32x32)                          2432.799         µs   per-row interpolation [3 iters]
+rs_encode_vector n=128                                          105.810         µs   O(n log n) FFT interpolation [20 iters]
+rs_encode_vector n=512                                          690.404         µs   O(n log n) FFT interpolation [20 iters]
+rs_encode_vector n=2048                                        3380.964         µs   O(n log n) FFT interpolation [20 iters]
+interp n=1024 [schoolbook O(n^2)]                             59140.728         µs   power sums + correlation loops [3 iters]
+interp n=1024 [FFT O(n log n)]                                 1159.739         µs   3 size-2n transforms [20 iters]
+Matrix transpose 256x256                                        718.317         µs   blocked, parallel [20 iters]
+reconstruct_2d 64x64 (60% cells erased)                       15962.040         µs   row/col fixpoint + full verify [3 iters]
+attested DAS session 16x16 (1 peer)                             438.307         µs   projection + Merkle, adaptive rounds [5 iters]
+custody put_column_verified 32x32                               296.881         µs   projection check + store [200 iters]
+custody try_reconstruct 32x32 (k cols)                         3205.422         µs   fixpoint decode + persist + verify [3 iters]
+PQ commit [FAST]                                                256.510         µs   MLWE commit; n=64, 4 chunks [10 iters]
+PQ open [FAST]                                                  273.073         µs   sigma-protocol + FS; n=64, 4 chunks [5 iters]
+PQ verify [FAST]                                                164.340         µs   2 equations; n=64, 4 chunks [10 iters]
+PQ commit [L1]                                                 5288.005         µs   MLWE commit; n=1024, 4 chunks [10 iters]
+PQ open [L1]                                                  12902.398         µs   sigma-protocol + FS; n=1024, 4 chunks [5 iters]
+PQ verify [L1]                                                12679.530         µs   2 equations; n=1024, 4 chunks [10 iters]
+====================================================================================================
+```
+
+Highlights of the v1.1.0 → v1.2.0 pass:
+
+* **Interpolation kernel 49x at n = 1024** (59.1 ms → 1.16 ms): the
+  power-sum loop is one NTT and the coefficient correlation is an exact
+  cyclic convolution with a cached NTT(Q).
+* **ZODA commit 64×64: 39 ms → 15.5 ms** (2.5x) — the FFT interpolation
+  compounds across all 128 row and 128 column encodes; from v1.0.0 the
+  cumulative speedup is 255 ms → 15.5 ms (**16.5x**).
+* **reconstruct_2d recovers a 64×64 grid with 60% of its cells erased**
+  in 15.9 ms, including the full final projection verification of all
+  128 lines.
+* **Whole attested sampling session over a 16×16 grid in 438 µs** —
+  adaptive rounds, projection + Merkle checks, peer scoring and exact
+  confidence accounting included.
+* **Custody ingest at 297 µs/column** (verified), full custody
+  reconstruction (k columns, fixpoint + persist + re-verify) at 3.2 ms.
 
 ## Results (v1.1.0 — after the optimization pass)
 

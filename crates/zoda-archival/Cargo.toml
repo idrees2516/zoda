@@ -9,3 +9,5 @@ description = "Archival node service: column custody storage, snapshots, reconst
 zoda-math = { path = "../zoda-math" }
 zoda-core = { path = "../zoda-core" }
 zoda-das = { path = "../zoda-das" }
+zoda-kzg = { path = "../zoda-kzg" }
+zoda-edas = { path = "../zoda-edas" }

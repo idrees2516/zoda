@@ -217,7 +217,7 @@ macro_rules! mont_field {
                 let (v, _b) = Self::sbb(e[0], 2, 0);
                 e[0] = v;
                 let mut acc = Self::R1;
-                let mut base = a;
+                let base = a;
                 // find top set bit
                 let mut top = $limbs - 1;
                 while top > 0 && e[top] == 0 {

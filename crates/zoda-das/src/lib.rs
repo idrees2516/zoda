@@ -1,10 +1,36 @@
-//! # zoda-das — data availability sampling over the ZODA tensor code
+//! # zoda-das — 2D data availability sampling
 //!
-//! * [`SamplingPlan`] — how many row/column samples achieve a target
-//!   detection probability against a withholding adversary,
-//! * [`sample_session`] — run a sampling session against a peer oracle,
-//!   verifying every sample with the zero-overhead checks,
-//! * reconstruction triggers once enough columns are available.
+//! Three sampling engines over two grid families:
+//!
+//! * **ZODA tensor grids** ([`sample_session`], the upgraded
+//!   [`run_attested_session`]) — full-row/full-column sampling with
+//!   zero-overhead projection checks, optional Merkle attestation,
+//!   multi-peer routing, and adaptive rounds driven by the exact
+//!   rectangle-escape bound.
+//! * **EIP-7594 blob grids** ([`sample_cell_session`]) — cell-level 2D
+//!   sampling: column draws (custody-first), per-blob FK20 cell proofs,
+//!   single-pairing batch verification, per-column custody accumulation.
+//! * **Theory** ([`availability`]) — the exact minimal-withholding-set
+//!   analysis for tensor codes and blob grids, with log-space
+//!   hypergeometric bounds used by both engines.
+
+pub mod availability;
+pub mod cell_das;
+pub mod session;
+
+pub use availability::{
+    blob_column_miss_probability, blob_column_samples_for_target, cell_miss_probability,
+    cell_miss_probability_replacement, cell_samples_for_target, line_miss_probability,
+    min_withholding_cells, BLOB_MIN_HIDDEN_CELLS,
+};
+pub use cell_das::{
+    custody_columns_for, sample_cell_session, BlobGrid, BlobGridMeta, CellOracle, CellSessionConfig,
+    CellSessionReport, GridOracle,
+};
+pub use session::{
+    run_attested_session, verify_attested_column, verify_attested_row, AttestedOracle,
+    AttestedSample, DasSessionReport, PeerScore, ProverOracle, SessionConfig, Verdict,
+};
 
 pub use zoda_core::{Matrix, ZodaParams, ZodaPublic};
 use zoda_math::stats;

@@ -28,7 +28,6 @@ impl ZodaRng {
     }
 
     /// Non-deterministic RNG seeded from the operating system.
-    #[cfg(feature = "std")]
     pub fn from_os() -> Self {
         use std::io::Read;
         let mut seed = [0u8; 32];

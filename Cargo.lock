@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "zoda"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-archival",
  "zoda-bls",
@@ -22,17 +22,20 @@ dependencies = [
 
 [[package]]
 name = "zoda-archival"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-core",
  "zoda-das",
+ "zoda-edas",
+ "zoda-kzg",
  "zoda-math",
 ]
 
 [[package]]
 name = "zoda-bench"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
+ "zoda-archival",
  "zoda-bls",
  "zoda-core",
  "zoda-das",
@@ -44,14 +47,14 @@ dependencies = [
 
 [[package]]
 name = "zoda-bls"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-math",
 ]
 
 [[package]]
 name = "zoda-bridges"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-core",
  "zoda-kzg",
@@ -60,22 +63,24 @@ dependencies = [
 
 [[package]]
 name = "zoda-core"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-math",
 ]
 
 [[package]]
 name = "zoda-das"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-core",
+ "zoda-edas",
+ "zoda-kzg",
  "zoda-math",
 ]
 
 [[package]]
 name = "zoda-edas"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-bls",
  "zoda-kzg",
@@ -84,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "zoda-ethrex"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-bls",
  "zoda-edas",
@@ -94,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "zoda-kzg"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-bls",
  "zoda-math",
@@ -102,18 +107,18 @@ dependencies = [
 
 [[package]]
 name = "zoda-math"
-version = "1.0.0"
+version = "1.2.0"
 
 [[package]]
 name = "zoda-pq"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-math",
 ]
 
 [[package]]
 name = "zoda-rda"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-bls",
  "zoda-core",
@@ -124,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "zoda-sybils"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zoda-bls",
  "zoda-math",

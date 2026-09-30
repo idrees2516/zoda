@@ -15,11 +15,29 @@ pub fn log_factorial(n: u64) -> f64 {
 }
 
 /// ln of the binomial coefficient C(n, k).
+///
+/// For `min(k, n−k) ≤ 1024` the exact product
+/// `Σ ln((n−i)/(i+1))` is used — absolute error ~1e-15 (the
+/// Stirling-series differences below lose ~1e-8 absolute precision to
+/// cancellation, which matters for hypergeometric *ratios* used by the
+/// DAS confidence machinery).
 pub fn log_binomial(n: u64, k: u64) -> f64 {
     if k > n {
         return f64::NEG_INFINITY;
     }
-    log_factorial(n) - log_factorial(k) - log_factorial(n - k)
+    let k = k.min(n - k);
+    if k == 0 {
+        return 0.0;
+    }
+    if k <= 1024 {
+        let mut acc = 0.0f64;
+        for i in 0..k {
+            acc += ((n - i) as f64 / (i + 1) as f64).ln();
+        }
+        acc
+    } else {
+        log_factorial(n) - log_factorial(k) - log_factorial(n - k)
+    }
 }
 
 /// Probability that a Binomial(n, p) is ≤ k (regularised incomplete beta

@@ -13,6 +13,7 @@ zoda-core = { path = "../zoda-core" }
 zoda-pq = { path = "../zoda-pq" }
 zoda-das = { path = "../zoda-das" }
 zoda-edas = { path = "../zoda-edas" }
+zoda-archival = { path = "../zoda-archival" }
 
 [[bin]]
 name = "zoda-bench"

@@ -35,10 +35,12 @@ pub mod encode;
 pub mod params;
 pub mod sample;
 pub mod reconstruct;
+pub mod reconstruct2;
 
 pub use encode::{extend_columns, extend_rows, tensor_encode, Matrix};
 pub use params::{ZodaParams, ZodaProver, ZodaPublic, ENC_ROW, ENC_COL};
 pub use reconstruct::reconstruct;
+pub use reconstruct2::{verify_codeword, PartialGrid, ReconError, ReconStats, reconstruct_2d};
 pub use sample::{verify_column_sample, verify_row_sample};
 
 #[cfg(test)]

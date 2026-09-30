@@ -72,15 +72,22 @@ Pippenger with a thread-parallel path for large batches.
 
 ### zoda-core
 The ZODA protocol itself. Encoding is systematic Reed–Solomon over
-roots-of-unity domains: `rs_encode_vector` interpolates the data points
-with the subproduct tree (O(n log² n)) and evaluates on the 2n-domain
-with one NTT — the reference prototype's O(n²) Vandermonde multiplication
-is gone. The tensor encoding is two passes (extend rows, then columns).
-Commitments are Merkle trees over rows and columns; the random projections
-`g_r`, `g_r2` (and their encodings `z_r`, `z_r2`) are Fiat–Shamir-derived
-from the two roots, binding every sample check to the committed data.
-Sampling verification is a single O(width) inner product per sample.
-Reconstruction interpolates each row from any k of its 2k symbols.
+roots-of-unity domains: `rs_encode_vector` runs **O(n log n)** — the
+transposed-Vandermonde identity's two quadratic kernels both collapse
+into butterfly transforms (the power sums are a single size-2n NTT; the
+coefficient correlation is an exact size-2n cyclic convolution with a
+cached NTT(Q)), then one evaluation NTT. The tensor encoding is two
+passes (extend rows, then columns — the column pass transposed and
+blocked for cache locality on large grids). Commitments are Merkle
+trees over rows and columns; the random projections `g_r`, `g_r2` (and
+their encodings `z_r`, `z_r2`) are Fiat–Shamir-derived from the two
+roots, binding every sample check to the committed data. Sampling
+verification is a single O(width) inner product per sample.
+Reconstruction handles both the fast full-column path (shared Lagrange
+basis) and `reconstruct_2d` — the row/column **fixpoint decoder for
+arbitrary scattered cell loss**, with per-line consistency checks
+against present cells and a final projection verification of the
+recovered grid, plus fetch guidance when a decode stalls.
 
 ### zoda-pq
 The post-quantum polynomial commitment: BDLOP Module-LWE commitments plus
@@ -97,14 +104,34 @@ proofs instead of 128 separate quotient MSMs), the batch verifier
 cells), erasure recovery from any 64 cells (vanishing polynomial on the
 X^64-spread, coset division), and the custody-group scheduling helpers.
 
-### zoda-das, zoda-rda, zoda-sybils, zoda-archival, zoda-bridges
-Service layers. `zoda-das` plans and executes sampling sessions with
-exact without-replacement miss probabilities. `zoda-rda` adapts sample
-counts to a confidence target with early exit. `zoda-sybils` provides
-BLS-signed sortition, stake-weighted selection and windowed peer scoring.
-`zoda-archival` is the column custody store with reconstruction triggers.
-`zoda-bridges` packages ZODA row-inclusion proofs and KZG-backed message
-commitments for light clients.
+### zoda-das
+The 2D sampling engines and the availability theory. `availability`
+holds the exact minimal-withholding-set analysis (the (m+1)×(k+1)
+rectangle for tensor grids, the 65-of-128 cell bound for EIP-7594 blobs)
+with log-space hypergeometric escape bounds — no approximations.
+`session` runs attested line sessions: Merkle-proof-bound row/column
+samples, multi-peer round-robin routing with per-peer scorecards,
+custody-first scheduling, adaptive rounds driven by the exact escape
+bound, fail-closed verdicts. `cell_das` is the Fulu-flavoured engine
+over blob grids: column draws, per-blob FK20 cell proofs, single-pairing
+batch verification per round, per-column custody accumulation.
+
+### zoda-rda, zoda-sybils, zoda-bridges
+Service layers. `zoda-rda` adapts sample counts to a confidence target
+with early exit. `zoda-sybils` provides BLS-signed sortition,
+stake-weighted selection and windowed peer scoring. `zoda-bridges`
+packages ZODA row-inclusion proofs and KZG-backed message commitments
+for light clients.
+
+### zoda-archival
+Custody storage with a security-first discipline: verify-on-insert
+(projection checks for ZODA columns, batch cell-proof verification for
+EIP-7594 columns), reconstruction that persists and re-verifies its
+result, exact byte accounting, and slot-ordered pruning to a byte
+budget. Two compact, checksummed, self-describing file formats
+(`ZODACST1` grids, `ZODACEL1` cell columns) written atomically by
+`DiskCustody`; the public verification parameters are embedded in every
+file so loaded custody is re-verifiable standalone.
 
 ### zoda-ethrex
 Byte-compatible `BlobTransactionSidecar` with the validation ethrex runs
@@ -123,14 +150,19 @@ blob ─ blob_to_kzg_commitment (EIP-4844)         ──► commitment per blob
 
 ### Sampling (block validation, light node)
 ```
-plan (confidence target) ─► distinct row/col draws
-   each sample ─► ZODA projection check (O(width)) ─► verdict + confidence
+plan (exact rectangle-escape bound) ─► draws (custody columns first)
+   ZODA lines: projection check + Merkle inclusion ─► per-peer scorecards
+   blob cells: fetch (blob, column) + FK20 proof ─► one batch pairing/round
+                                                        ─► verdict + confidence
 ```
 
 ### Reconstruction (custody node / archival)
 ```
 ≥ k of 2k columns ─► per-row interpolation ─► full tensor codeword
-≥ 64 of 128 cells  ─► vanishing-poly erasure decode ─► 128 cells + proofs
+scattered cells   ─► row/col fixpoint + projection verify ─► full grid
+                     (stall ─► guidance: which cells to fetch next)
+≥ 64 of 128 cells ─► vanishing-poly erasure decode ─► 128 cells + proofs
+recovered custody ─► re-verify ─► persist (atomic, checksummed)
 ```
 
 ## Design decisions worth knowing

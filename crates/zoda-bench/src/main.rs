@@ -33,6 +33,7 @@ fn bench<T>(name: &str, note: &str, iters: usize, mut f: impl FnMut() -> T) -> T
     for _ in 0..iters {
         last = Some(f());
     }
+    std::hint::black_box(&last);
     let dt = t0.elapsed().as_nanos() / iters as u128;
     Timed {
         name: name.to_string(),
@@ -60,12 +61,12 @@ fn main() {
     // ---------------- field + NTT ----------------
     if filter.is_empty() || filter == "math" {
         let mut x = rng.next_fr(false);
-        let mut y = rng.next_fr(false);
+        let y = rng.next_fr(false);
         results.push(bench("Fr mul (Montgomery, 4 limbs)", "field core", 1_000_000, || {
             x = x * y;
             x
         }));
-        let mut xs = rng.next_fr(false);
+        let xs = rng.next_fr(false);
         results.push(bench("Fr invert (Fermat)", "batch-invert backbone", 500, || {
             xs.invert()
         }));
@@ -240,6 +241,162 @@ fn main() {
             3,
             || zoda_core::reconstruct(&public, &kept, &prover.matrix),
         ));
+    }
+
+    // ---------------- 2D erasure coding + DAS deep dive ----------------
+    if filter.is_empty() || filter == "das2d" {
+        // RS vector encode across the FFT-path sizes
+        for log in [7u32, 9, 11] {
+            let n = 1usize << log;
+            let domain = FftDomain::<Fr>::new(2 * n);
+            let data: Vec<Fr> = (0..n).map(|_| rng.next_fr(false)).collect();
+            let mb = (n * 32 * 2) as f64;
+            results.push(bench(
+                &format!("rs_encode_vector n={}", n),
+                "O(n log n) FFT interpolation",
+                20,
+                || zoda_core::encode::rs_encode_vector(&data, &domain),
+            ));
+            let last = results.last().unwrap();
+            println!(
+                "    -> rs_encode_vector n={} throughput: {}",
+                n,
+                fmt_bytes(mb / (last.ns as f64 / 1e9))
+            );
+        }
+        // schoolbook vs FFT at n = 1024 (the optimization this session)
+        {
+            let n = 1024usize;
+            let data: Vec<Fr> = (0..n).map(|_| rng.next_fr(false)).collect();
+            let enc = zoda_core::encode::geometric_encoder_public(n);
+            results.push(bench(
+                "interp n=1024 [schoolbook O(n^2)]",
+                "power sums + correlation loops",
+                3,
+                || enc.interpolate_fast(&data),
+            ));
+            results.push(bench(
+                "interp n=1024 [FFT O(n log n)]",
+                "3 size-2n transforms",
+                20,
+                || enc.interpolate_fft(&data),
+            ));
+        }
+        // transpose
+        {
+            let n = 256usize;
+            let data: Vec<Fr> = (0..n * n).map(|_| rng.next_fr(false)).collect();
+            let m = Matrix::from_row_major(n, n, data);
+            results.push(bench(
+                &format!("Matrix transpose {}x{}", n, n),
+                "blocked, parallel",
+                20,
+                || m.transpose(),
+            ));
+        }
+        // 2D scattered-erasure reconstruction
+        {
+            let (m, k) = (32usize, 32usize);
+            let mut data = vec![Fr::zero(); m * k];
+            for x in data.iter_mut() {
+                *x = rng.next_fr(false);
+            }
+            let grid = Matrix::from_row_major(m, k, data);
+            let params = ZodaParams::new(m, k);
+            let prover = params.commit(&grid);
+            let public = prover.public_params();
+            let mut rng2 = ZodaRng::from_seed(*b"das2d-bench-seed-000000000000000");
+            let mut erased = Vec::new();
+            for r in 0..64 {
+                for c in 0..64 {
+                    if rng2.next_u64() % 10 < 6 {
+                        erased.push((r, c));
+                    }
+                }
+            }
+            results.push(bench(
+                "reconstruct_2d 64x64 (60% cells erased)",
+                "row/col fixpoint + full verify",
+                3,
+                || {
+                    let mut partial = zoda_core::PartialGrid::with_erasures(&prover.matrix, &erased);
+                    zoda_core::reconstruct_2d(&mut partial, &params, &public)
+                },
+            ));
+        }
+        // attested multi-peer session (16x16 grid)
+        {
+            let (m, k) = (16usize, 16usize);
+            let mut data = vec![Fr::zero(); m * k];
+            for x in data.iter_mut() {
+                *x = rng.next_fr(false);
+            }
+            let grid = Matrix::from_row_major(m, k, data);
+            let params = ZodaParams::new(m, k);
+            let prover = params.commit(&grid);
+            let public = prover.public_params();
+            results.push(bench(
+                "attested DAS session 16x16 (1 peer)",
+                "projection + Merkle, adaptive rounds",
+                5,
+                || {
+                    let mut oracle = zoda_das::ProverOracle::honest(&prover);
+                    let mut peers: [&mut dyn zoda_das::AttestedOracle; 1] = [&mut oracle];
+                    let mut r = ZodaRng::from_seed(*b"das2d-sess-seed-0000000000000000");
+                    zoda_das::run_attested_session(
+                        &public,
+                        &params,
+                        &mut peers,
+                        &zoda_das::SessionConfig::default(),
+                        &mut r,
+                    )
+                },
+            ));
+        }
+        // archival: custody ingest + reconstruct + serialize
+        {
+            let (m, k) = (32usize, 32usize);
+            let mut data = vec![Fr::zero(); m * k];
+            for x in data.iter_mut() {
+                *x = rng.next_fr(false);
+            }
+            let grid = Matrix::from_row_major(m, k, data);
+            let params = ZodaParams::new(m, k);
+            let prover = params.commit(&grid);
+            let public = prover.public_params();
+            results.push(bench(
+                "custody put_column_verified 32x32",
+                "projection check + store",
+                200,
+                || {
+                    let mut c = zoda_archival::GridCustody::new(
+                        [1u8; 32],
+                        1,
+                        ZodaParams::new(m, k),
+                        public.clone(),
+                    );
+                    c.put_column_verified(0, prover.matrix.col(0)).unwrap();
+                    c
+                },
+            ));
+            results.push(bench(
+                "custody try_reconstruct 32x32 (k cols)",
+                "fixpoint decode + persist + verify",
+                3,
+                || {
+                    let mut c = zoda_archival::GridCustody::new(
+                        [1u8; 32],
+                        1,
+                        ZodaParams::new(m, k),
+                        public.clone(),
+                    );
+                    for i in 0..k {
+                        c.put_column_verified(i, prover.matrix.col(i)).unwrap();
+                    }
+                    c.try_reconstruct().unwrap()
+                },
+            ));
+        }
     }
 
     // ---------------- post-quantum lattice ----------------

@@ -195,6 +195,7 @@ pub fn interpolate<F: PrimeField>(points: &[F], values: &[F]) -> Poly<F> {
 }
 
 /// `a - b` keeping the result reduced mod `m` (polynomial sense).
+#[allow(dead_code)]
 fn sub_mod<F: PrimeField>(a: &[F], b: &[F], _m: &[F]) -> Poly<F> {
     let n = a.len().max(b.len());
     let mut out = vec![F::zero(); n];
