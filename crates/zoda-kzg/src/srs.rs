@@ -26,6 +26,13 @@ pub const FIELD_ELEMENTS_PER_EXT_BLOB: usize = 2 * FIELD_ELEMENTS_PER_BLOB;
 
 /// The precomputed KZG context.
 pub struct Setup {
+    /// Process-unique identity assigned at construction. Setups built
+    /// from the same ceremony by different paths are distinct objects,
+    /// and equal-content setups are cheap to distinguish; downstream
+    /// process-wide caches (the FK20 Straus tables) key on this id —
+    /// content-probing keys like "first monomial point" are NOT unique
+    /// (`[τ⁰] = g1` for every setup).
+    pub id: u64,
     /// Roots of unity of the 8192-domain, natural order (`roots[i] = ω^i`).
     pub roots_of_unity: Vec<Fr>,
     /// Bit-reversed roots of unity (4096-domain order for blob evals).
@@ -154,7 +161,10 @@ impl Setup {
         bit_reverse_points(&mut g1_lagrange_brp);
 
         let g2_gen = g2_monomial[0];
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Setup {
+            id,
             roots_of_unity,
             brp_roots_of_unity: brp,
             g1_lagrange_brp,

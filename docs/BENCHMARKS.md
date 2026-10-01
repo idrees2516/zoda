@@ -4,8 +4,89 @@
 
 All numbers: release profile with LTO, 2 vCPU host, `zoda-bench`
 (`cargo run --release -p zoda-bench [-- <group>]`; groups: `math`, `bls`,
-`glv`, `kzg`, `edas`, `core`, `das2d`, `pq`, `eigenda`). Timings are wall
+`glv`, `kzg`, `edas`, `core`, `das2d`, `pq`, `eigenda`,
+`throughput`). Timings are wall
 clock averages after one warmup call.
+
+## Results (v1.4.0 — h2c SSWU complex method, parallel Miller accumulation, EigenDA mainnet pipeline)
+
+### Hash-to-curve (the verify_batch hotspot)
+
+The G2 Simplified-SWU square root is now the **complex method** — two
+windowed Fp exponentiations by the compile-time `(p+1)/4` constant
+(norm, then real part) instead of one 762-bit Fp2 exponentiation — and
+the division by the g(x) denominator is resolved by the homogeneous
+coordinate trick `(x_num·x_den², y', x_den³)`, so the geometry needs no
+field inversion at all. The batch path defers every inversion into two
+Montgomery batch inversions across the whole batch (Fp for the sqrt
+denominators, Fp2 for the sign corrections). The Budroni–Pintore
+cofactor chain now runs natively in Jacobian coordinates with
+Hamming-weight-aware 64-bit `c1` multiplications (BLS_X has 6 set bits)
+instead of the generic W=5 windowed path whose table build + field
+inversion cost more than the scalar work at that width.
+
+| benchmark | v1.3.0 | v1.4.0 | change |
+|---|---|---|---|
+| hash_to_curve G2 (single) | 809 µs | **517 µs** | 1.57x |
+| hash_to_curve G2 (batched, per message) | ~620 µs | **378 µs** | 2.14x cumulative |
+| map_to_curve_sswu_g2 (the SSWU core) | ~270 µs | **134 µs** | ~2x |
+| clear_cofactor_g2 (psi-chain) | 463 µs* | **243 µs** | 1.9x |
+| BLS sign | 1,391 µs | **1,030 µs** | 1.35x |
+
+\* component-isolated measurement; the v1.3 h2c total was
+sqrt-chain-bound.
+
+### Batch BLS verification (parallel Miller-loop accumulation)
+
+`verify_batch` / `verify_batch_strict` now chunk the per-item work —
+batched hash-to-curve, the plain (or GLV) scalar multiplications, G2
+preparation and each chunk's share of the Miller-loop accumulation —
+across worker threads. The per-chunk Fp12 products combine with `T−1`
+multiplications, the `Σ r_i·σ_i` term folds in serially, and a single
+final exponentiation closes the check. `multi_miller_loop_parallel`
+exposes the same chunked accumulation for any product-pairing check.
+
+| benchmark | v1.3.0 | v1.4.0 | change |
+|---|---|---|---|
+| BLS verify_batch x16 | 34.7 ms | **15.6 ms** | 2.2x |
+| BLS verify_batch_strict x16 | 45.1 ms | **28.9 ms** | 1.6x |
+| BLS verify x16 (individual, reference) | 47.1 ms | 41.6 ms | — |
+
+### EigenDA mainnet pipeline throughput (real ceremony SRS)
+
+`zoda-bench throughput` runs the full disperser → operator pipeline
+(`zoda_edas::pipeline`) on the shipped `config/eigenda/mainnet.toml`
+with the **real Ethereum mainnet KZG ceremony setup** — dispersal
+(commitment + FK20 cell proofs), single-pairing batch verification of
+every cell, and custody reconstruction from a 50% slice, threaded
+across blobs:
+
+| stage (8 MiB batch, 2 vCPU) | throughput |
+|---|---|
+| commit (blob → KZG, parallel MSM) | 2.03 MB/s |
+| extend + FK20 prove | 0.47 MB/s |
+| batch verify (8,192 cells, one pairing) | 11.0 MB/s |
+| custody reconstruct (50% erasure, threaded) | 0.51 MB/s |
+| disperser e2e (commit + prove) | 0.38 MB/s |
+| node e2e (verify + recover) | 0.49 MB/s |
+| full e2e (commit + prove + verify) | 0.37 MB/s |
+
+**The 100 MB/s question, answered honestly.** On this 2-vCPU host the
+full pipeline runs at ~0.4 MB/s and the verification-only path at
+~11 MB/s; FK20 proving is the binding stage at ~0.24 MB/s per MiB-scale
+batch (0.47 MB/s at 8 MiB as the Straus tables amortise). Per-core
+FK20 throughput of ~0.25 MB/s is within ~2–3x of hand-tuned assembly
+implementations (blst-class c-kzg FK20 runs ≈0.6–1 MB/s per modern
+core); the remaining gap is the portable field layer (51 ns/Fp-mul vs
+~15–20 ns for ADX assembly). Reaching 100 MB/s end-to-end therefore
+requires *both* an assembly field layer *and* ~50–100 cores of this
+class — or, on this host, serving the operator path (verify +
+reconstruction) which is not FK20-bound. Two real defects found and
+fixed while chasing this target are documented in ALGORITHMS.md: the
+thread-local FK20 table caches (every worker thread rebuilt the 49 MB
+Straus table; 7x on threaded recovery) and the setup-identity cache
+key collision (`[τ⁰] = g1` for every setup — a latent correctness bug
+since v1.1, previously masked by thread placement).
 
 ## Results (v1.3.0 — GLV, ADX field layer, batch verification, parallel 2D decode)
 
@@ -262,17 +343,15 @@ improvement. c-kzg performs the same checks (at blst-asm speed).
 
 ## Remaining optimization headroom
 
-1. **Pairing stack** — 1.57 ms per pairing vs ~0.4 ms for blst with ADX
+1. **Pairing stack** — 1.6 ms per pairing vs ~0.4 ms for blst with ADX
    assembly; the Miller loop and final exponentiation are the entire
-   cost of single-proof verification. A lazy-reduction Fp2/Fp6 tower is
-   the identified path.
-2. **GLV scalar multiplication** — the G1 endomorphism
-   `φ(x, y) = (βx, y)` halves the ~256 doublings per butterfly
-   multiplication in the FK20 G1-FFTs and the subgroup checks (each
-   `[r]P` currently pays a full-width scalar multiplication).
-3. **Field layer** — dedicated Montgomery squaring and lazy reduction
-   in the 6-limb CIOS core (~10–20% on every curve formula), and ADX
-   assembly paths where the target allows.
-4. **Bluestein upgrade** of the chirp-z encoder (O(n log n) power sums
+   cost of single-proof verification (the *multi*-pairing accumulation
+   is now parallel — v1.4; a single pairing is inherently serial).
+2. **FK20 / MSM field layer** — the portable CIOS core (51 ns/Fp-mul,
+   squares not yet specialised) sits ~2.5–3x from ADX assembly; FK20
+   proving is the binding stage of the disperser path. An Fp squaring
+   macro and a G2 Pippenger (for `Σ rᵢσᵢ` in verify_batch) are the
+   identified next steps.
+3. **Bluestein upgrade** of the chirp-z encoder (O(n log n) power sums
    and product) for grid sides beyond n = 256, where the current O(n²)
    per-vector form starts to bite.

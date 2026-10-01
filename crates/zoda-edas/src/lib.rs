@@ -11,6 +11,8 @@
 //! `CELLS_PER_EXT_BLOB = 128`, `NUMBER_OF_COLUMNS = 128`.
 
 use zoda_kzg::msm::G1J;
+
+pub mod pipeline;
 use zoda_kzg::srs::{Setup, FIELD_ELEMENTS_PER_BLOB, FIELD_ELEMENTS_PER_EXT_BLOB};
 use zoda_math::{batch_invert, FftDomain, Fr, PrimeField};
 use zoda_math::ntt::bit_reversal_permutation_typed;
@@ -281,29 +283,51 @@ fn strauss_row_msm(
     acc
 }
 
-thread_local! {
-    /// Cached FK20 columns keyed by the Setup's G1 monomial first point
-    /// (cheap identity for the toy setups; real setups are loaded once
-    /// per process anyway).
-    static FK20_COLUMNS: std::cell::RefCell<
-        std::collections::HashMap<[u8; 48], std::rc::Rc<Vec<Vec<zoda_bls::g1::G1Affine>>>>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
-
-    /// Cached Straus window tables for the FK20 column points:
-    /// `tables[row][offset][d-1] = d·columns[row][offset]` for d in 1..=63.
-    /// 63 affine multiples per point — ~49 MB for the 128×64 matrix,
-    /// built once per setup (a one-time cost mirroring c-kzg's
-    /// fixed-base precompute option).
-    static FK20_TABLES: std::cell::RefCell<
-        std::collections::HashMap<[u8; 48], std::rc::Rc<Vec<Vec<Vec<zoda_bls::g1::G1Affine>>>>>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+/// Process-wide FK20 caches, keyed by the Setup's G1 monomial first
+/// point (cheap identity for the toy setups; real setups are loaded
+/// once per process anyway). **Shared across threads** (Arc), so worker
+/// threads — batched recovery, threaded pipelines — never rebuild the
+/// ~49 MB Straus table that a thread_local cache would force on every
+/// fresh thread. The build runs under the cache Mutex: concurrent
+/// first-callers serialise on it once and then all observe the entry
+/// (the build itself is single-threaded, so nothing is lost).
+fn fk20_column_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<u64, std::sync::Arc<Vec<Vec<zoda_bls::g1::G1Affine>>>>,
+> {
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                u64,
+                std::sync::Arc<Vec<Vec<zoda_bls::g1::G1Affine>>>,
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn setup_key(setup: &Setup) -> [u8; 48] {
-    let v = setup.g1_monomial[0].to_compressed();
-    let mut k = [0u8; 48];
-    k.copy_from_slice(&v);
-    k
+/// Straus window tables for the FK20 column points:
+/// `tables[row][offset][d-1] = d·columns[row][offset]` for d in 1..=63.
+/// 63 affine multiples per point — ~49 MB for the 128×64 matrix,
+/// built once per setup (a one-time cost mirroring c-kzg's
+/// fixed-base precompute option).
+fn fk20_table_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<u64, std::sync::Arc<Vec<Vec<Vec<zoda_bls::g1::G1Affine>>>>>,
+> {
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                u64,
+                std::sync::Arc<Vec<Vec<Vec<zoda_bls::g1::G1Affine>>>>,
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Cache key: the setup's process-unique construction id (NOT a content
+/// probe — the monomial points of distinct setups share `[τ⁰] = g1`).
+fn setup_key(setup: &Setup) -> u64 {
+    setup.id
 }
 
 /// The FK20 setup columns: x_ext_fft_columns[row][offset] for row in
@@ -313,19 +337,18 @@ fn setup_columns(setup: &Setup) -> Vec<Vec<zoda_bls::g1::G1Affine>> {
     setup_columns_cached(setup).to_vec()
 }
 
-fn setup_columns_cached(setup: &Setup) -> std::rc::Rc<Vec<Vec<zoda_bls::g1::G1Affine>>> {
+fn setup_columns_cached(setup: &Setup) -> std::sync::Arc<Vec<Vec<zoda_bls::g1::G1Affine>>> {
     let key = setup_key(setup);
-    FK20_COLUMNS.with(|cache| {
-        {
-            let c = cache.borrow();
-            if let Some(cols) = c.get(&key) {
-                return cols.clone();
-            }
-        }
-        let cols = std::rc::Rc::new(setup_columns_uncached(setup));
-        cache.borrow_mut().insert(key, cols.clone());
-        cols
-    })
+    let cache = fk20_column_cache();
+    let mut c = cache
+        .lock()
+        .expect("fk20 column cache poisoned");
+    if let Some(cols) = c.get(&key) {
+        return cols.clone();
+    }
+    let cols = std::sync::Arc::new(setup_columns_uncached(setup));
+    c.insert(key, cols.clone());
+    cols
 }
 
 fn setup_columns_uncached(setup: &Setup) -> Vec<Vec<zoda_bls::g1::G1Affine>> {
@@ -361,46 +384,43 @@ fn setup_columns_uncached(setup: &Setup) -> Vec<Vec<zoda_bls::g1::G1Affine>> {
 /// Build (and cache) the Straus 6-bit window tables for the FK20
 /// columns. All 8,192 × 63 multiples are produced with one inversion
 /// via a single batch normalization.
-fn fk20_tables(setup: &Setup) -> std::rc::Rc<Vec<Vec<Vec<zoda_bls::g1::G1Affine>>>> {
+fn fk20_tables(setup: &Setup) -> std::sync::Arc<Vec<Vec<Vec<zoda_bls::g1::G1Affine>>>> {
     let key = setup_key(setup);
-    FK20_TABLES.with(|cache| {
-        {
-            let c = cache.borrow();
-            if let Some(t) = c.get(&key) {
-                return t.clone();
+    let cache = fk20_table_cache();
+    let mut c = cache.lock().expect("fk20 table cache poisoned");
+    if let Some(t) = c.get(&key) {
+        return t.clone();
+    }
+    let columns = setup_columns(setup);
+    const PER: usize = 63; // multiples 1..=63 per point
+    let total: usize = columns.len() * FIELD_ELEMENTS_PER_CELL * PER;
+    let mut flat: Vec<G1J> = Vec::with_capacity(total);
+    for row in &columns {
+        for p in row {
+            let base = G1J::from_affine(p);
+            let mut cur = base;
+            flat.push(base); // 1·P
+            for _ in 1..PER {
+                cur = cur.add(&base);
+                flat.push(cur);
             }
         }
-        let columns = setup_columns(setup);
-        const PER: usize = 63; // multiples 1..=63 per point
-        let total: usize = columns.len() * FIELD_ELEMENTS_PER_CELL * PER;
-        let mut flat: Vec<G1J> = Vec::with_capacity(total);
-        for row in &columns {
-            for p in row {
-                let base = G1J::from_affine(p);
-                let mut cur = base;
-                flat.push(base); // 1·P
-                for _ in 1..PER {
-                    cur = cur.add(&base);
-                    flat.push(cur);
-                }
-            }
+    }
+    let norm = G1J::batch_normalize(&flat);
+    let mut tables: Vec<Vec<Vec<zoda_bls::g1::G1Affine>>> =
+        Vec::with_capacity(columns.len());
+    let mut it = norm.into_iter();
+    for row in &columns {
+        let mut row_t = Vec::with_capacity(row.len());
+        for _ in row {
+            let tab: Vec<zoda_bls::g1::G1Affine> = (&mut it).take(PER).collect();
+            row_t.push(tab);
         }
-        let norm = G1J::batch_normalize(&flat);
-        let mut tables: Vec<Vec<Vec<zoda_bls::g1::G1Affine>>> =
-            Vec::with_capacity(columns.len());
-        let mut it = norm.into_iter();
-        for row in &columns {
-            let mut row_t = Vec::with_capacity(row.len());
-            for _ in row {
-                let tab: Vec<zoda_bls::g1::G1Affine> = (&mut it).take(PER).collect();
-                row_t.push(tab);
-            }
-            tables.push(row_t);
-        }
-        let t = std::rc::Rc::new(tables);
-        cache.borrow_mut().insert(key, t.clone());
-        t
-    })
+        tables.push(row_t);
+    }
+    let t = std::sync::Arc::new(tables);
+    c.insert(key, t.clone());
+    t
 }
 
 /// Forward FFT over G1 (homogeneous in/out) — compatibility wrapper

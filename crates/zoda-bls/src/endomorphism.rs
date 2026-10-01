@@ -545,18 +545,51 @@ pub fn g2_lambda() -> Fr {
 /// t3 = t3 + t2 − t1 − P
 /// ```
 ///
-/// Two 64-bit scalar multiplications, one doubling, a handful of
-/// additions, and the cheap ψ/ψ2 coordinate maps — instead of the naive
-/// 640-bit `h_eff` multiplication (~4× faster).
+/// The whole chain runs **natively in Jacobian coordinates**: ψ and ψ2
+/// act componentwise on the `(X : Y : Z)` triple and commute with both
+/// projective models, and the two 64-bit `c1` multiplications use a
+/// Hamming-weight-aware double-and-add (BLS_X has 6 set bits — 63
+/// doublings + 5 general additions, no window table, no batch
+/// normalisation, no coordinate round-trips) instead of the generic
+/// W=5 windowed path whose table build and single field inversion cost
+/// more than the scalar work itself at this width.
 pub fn clear_cofactor_g2(p: &G2Projective) -> G2Projective {
-    let c1_mul = |pt: &G2Projective| -> G2Projective { pt.mul_limbs(&[BLS_X]).neg() };
-    let t1 = c1_mul(p); // t1 = c1·P
-    let t2 = g2_psi(p); // t2 = ψ(P)
-    let mut t3 = g2_psi2(&p.double()); // ψ2(2P)
-    t3 = t3.add(&t2.neg()); // t3 = ψ2(2P) − t2
+    let psi_j = |q: &Jacobian<G2Config>| -> Jacobian<G2Config> {
+        let g = g2_glv();
+        Jacobian {
+            x: g.psi_alpha * q.x.conjugate(),
+            y: g.psi_beta * q.y.conjugate(),
+            z: q.z.conjugate(),
+        }
+    };
+    let psi2_j = |q: &Jacobian<G2Config>| -> Jacobian<G2Config> {
+        let c = psi2_const();
+        Jacobian {
+            x: c * q.x,
+            y: -q.y,
+            z: q.z,
+        }
+    };
+    // [c1]Q = −[BLS_X]Q, straight double-and-add over the 6 set bits
+    let c1_mul = |q: &Jacobian<G2Config>| -> Jacobian<G2Config> {
+        let mut acc = *q;
+        let mut i = 62i8; // the MSB (bit 63) initialises acc = q
+        while i >= 0 {
+            acc = acc.double();
+            if (BLS_X >> i) & 1 == 1 {
+                acc = acc.add(q);
+            }
+            i -= 1;
+        }
+        acc.neg_j()
+    };
+    let pj = Jacobian::<G2Config>::from_homogeneous(p);
+    let t1 = c1_mul(&pj); // t1 = c1·P
+    let t2 = psi_j(&pj); // t2 = ψ(P)
+    let mut t3 = psi2_j(&pj.double()); // ψ2(2P)
+    t3 = t3.add(&t2.neg_j()); // t3 = ψ2(2P) − t2
     let t2 = c1_mul(&t1.add(&t2)); // t2 = c1·(t1 + t2)
-    t3 = t3.add(&t2).add(&t1.neg()).add(&p.neg());
-    t3
+    t3.add(&t2).add(&t1.neg_j()).add(&pj.neg_j()).to_homogeneous()
 }
 
 /// ψ2 = ψ∘ψ (RFC 9380 Appendix G.3): `(x, y) ↦ (c₁₂·x, −y)` with
@@ -828,7 +861,6 @@ mod tests {
         // round_div ties and signs
         let two = Sb::from_u64(2);
         let five = Sb::from_u64(5);
-        let three = Sb::from_u64(3);
         assert_eq!(round_div(&five, &two).m[0], 3);
         let neg_five = Sb { neg: true, ..five };
         assert!(round_div(&neg_five, &two).neg);

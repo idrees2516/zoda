@@ -115,8 +115,8 @@ assert!(zoda::pq::LatticePcs::verify(&params, &com, &zeta, &v, &proof));
 | `Fr` multiplication (ADX/BMI2 Montgomery) | **30 ns** | runtime-dispatched `mulx`/`adcx`/`adox` |
 | pairing (Miller + fountain final exp) | **1.6 ms** | lazy-reduction Fp2 |
 | BLS verify (2-term pairing_check) | **2.9 ms** | 1.4x vs v1.2 |
-| BLS `verify_batch` x16 | **34.7 ms** | 1.35x vs individual verifies |
-| BLS sign | **1.4 ms** | psi-chain cofactor clearing (RFC 9380 G.3) |
+| BLS `verify_batch` x16 | **15.6 ms** | 2.2x (batched h2c + parallel Miller accumulation) |
+| BLS sign | **1.0 ms** | complex-method SSWU + Jacobian psi-chain |
 | G1 scalar mul (GLV 2-dim, public points) | **133 µs** | derived beta/lambda endomorphism |
 | `blob_to_kzg_commitment` (4096 MSM) | 65 ms | Pippenger, 2 threads |
 | `verify_cell_kzg_proof_batch` (128 cells) | **31.8 ms** | batched subgroup checks (4.3x on the checks) |
@@ -124,6 +124,8 @@ assert!(zoda::pq::LatticePcs::verify(&params, &com, &zeta, &v, &proof));
 | ZODA commit (64x64 grid) | **15.5 ms** | |
 | `reconstruct_2d` 64x64, 60% cells erased | **10.8 ms** | parallel row/column fixpoint passes |
 | EigenDA-style batch verify (1024 cells) | **8.45 MB/s** | operator attestation throughput |
+| hash_to_curve G2 batched | **378 µs/msg** | complex-method sqrt + Montgomery batch inversion |
+| mainnet pipeline node e2e (8 MiB) | **0.49 MB/s** | verify + custody reconstruction, real ceremony SRS |
 
 Full tables, methodology and per-version history: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
@@ -145,7 +147,7 @@ Full tables, methodology and per-version history: [docs/BENCHMARKS.md](docs/BENC
 * **Official consensus-spec-tests conformance: 320/320 vector cases pass bit-exactly** against the real mainnet ceremony setup — all six Deneb EIP-4844 suites (253 cases) and all four Fulu EIP-7594 cell suites (67 cases). Run it yourself: `scripts/fetch_kzg_vectors.sh && cargo test -p zoda-kzg -p zoda-edas --release spec_vectors`. The harness caught and fixed three real spec deviations (challenge-transcript encoding, missing subgroup validation, non-canonical cell handling).
 * All Ethereum-flavoured crypto is validated against **official vectors**: RFC 9380 hash-to-curve (G1+G2), the mainnet KZG trusted setup parse + spec sanity check, and the full EIP-4844/7594 vector suites above.
 * The lattice PQ commitment is a **research prototype**: parameter sets are first estimates, not audited. See `docs/POST_QUANTUM.md`.
-* Since v1.3 the field layer closes most of the portable-Rust vs assembly gap with runtime-dispatched ADX/BMI2 Montgomery paths (`mulx`/`adcx`/`adox` codegen, no hand-written assembly, no external crates); GLV endomorphisms, lazy-reduction Fp2, batch verification and parallel 2D decode are documented in [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md).
+* Since v1.3 the field layer closes most of the portable-Rust vs assembly gap with runtime-dispatched ADX/BMI2 Montgomery paths (`mulx`/`adcx`/`adox` codegen, no hand-written assembly, no external crates); GLV endomorphisms, lazy-reduction Fp2, batch verification and parallel 2D decode are documented in [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md); v1.4 adds the complex-method SSWU hash-to-curve, parallel Miller-loop accumulation and the real-mainnet EigenDA pipeline ([`config/eigenda/mainnet.toml`](config/eigenda/mainnet.toml), verified endpoints + Ethereum ceremony SRS).
 
 ## License
 

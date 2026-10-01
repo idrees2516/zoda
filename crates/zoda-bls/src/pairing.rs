@@ -223,6 +223,7 @@ impl Fp12 {
 // ---------------------------------------------------------------------------
 
 /// Precomputed G2 data for the Miller loop.
+#[derive(Clone)]
 pub struct G2Prepared {
     pub infinity: bool,
     /// 68 line-coefficient triples (a, b, c) ∈ Fp2³
@@ -455,6 +456,71 @@ pub fn pairing_check(terms: &[(&G1Affine, &G2Prepared)]) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Parallel Miller-loop accumulation
+// ---------------------------------------------------------------------------
+
+/// Worker count for a multi-pairing accumulation: the available
+/// parallelism, capped by the term count (one term per thread at least)
+/// and by 8 (beyond that the Fp12 cross-products eat the gains on
+/// typical hosts). Returns 1 when threading is pointless.
+fn miller_threads(n_terms: usize) -> usize {
+    if n_terms < 4 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    cores.min(n_terms).min(8)
+}
+
+/// Parallel multi-pairing **Miller-loop accumulation** — the same result
+/// as [`multi_miller_loop`], computed by chunking the terms across
+/// worker threads and multiplying the per-chunk Fp12 products:
+///
+/// ```text
+/// Πᵢ ML(pᵢ, qᵢ) = Π_chunk ( Πᵢ∈chunk ML(pᵢ, qᵢ) )
+/// ```
+///
+/// Each chunk runs the full serial bit loop over its terms (the loop
+/// squarings are per-chunk, not per-term), and the cross-chunk
+/// combination costs only `T−1` Fp12 multiplications. The single final
+/// exponentiation still amortises over every term — this is the
+/// Miller-loop half of "n Miller loops + 1 final exp for the price of
+/// one", now with the n loops themselves in parallel.
+///
+/// Returns the identical Fp12 to the serial path (product of the same
+/// factors; Fp12 multiplication is associative and commutative).
+pub fn multi_miller_loop_parallel(terms: &[(&G1Affine, &G2Prepared)]) -> Fp12 {
+    let t = miller_threads(terms.len());
+    if t <= 1 {
+        return multi_miller_loop(terms);
+    }
+    let chunk = terms.len().div_ceil(t);
+    let mut result = Fp12::one();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = terms
+            .chunks(chunk)
+            .map(|c| scope.spawn(move || multi_miller_loop(c)))
+            .collect();
+        for h in handles {
+            result = result * h.join().expect("miller worker panicked");
+        }
+    });
+    result
+}
+
+/// [`pairing_check`] with the Miller-loop accumulation parallelised
+/// across the terms ([`multi_miller_loop_parallel`]); one serial final
+/// exponentiation on the combined Fp12.
+pub fn pairing_check_parallel(terms: &[(&G1Affine, &G2Prepared)]) -> bool {
+    let ml = multi_miller_loop_parallel(terms);
+    match final_exponentiation(&ml) {
+        Some(f) => f.is_one(),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,5 +615,33 @@ mod tests {
             (&G1Affine::identity(), &g2),
             (&neg_g1, &g2)
         ]));
+    }
+
+    #[test]
+    fn multi_miller_loop_parallel_matches_serial() {
+        // differential: the chunked parallel accumulation must equal the
+        // serial multi-pairing product, term for term
+        let mut rng = zoda_math::ZodaRng::from_seed(*b"miller-par-000000000000000000000");
+        let mut terms: Vec<(G1Affine, G2Prepared)> = Vec::new();
+        for _ in 0..17 {
+            let p = G1Projective::generator().mul_fr(&rng.next_fr(true)).to_affine();
+            let q = G2Projective::generator().mul_fr(&rng.next_fr(true)).to_affine();
+            terms.push((p, G2Prepared::from(q)));
+        }
+        let refs: Vec<(&G1Affine, &G2Prepared)> =
+            terms.iter().map(|(a, b)| (a, b)).collect();
+        assert_eq!(multi_miller_loop(&refs), multi_miller_loop_parallel(&refs));
+        // the full checks agree on the same (generically non-one) product
+        assert_eq!(pairing_check(&refs), pairing_check_parallel(&refs));
+        // telescoping identity: e(P, Q)·e(−P, Q) = 1 per pair
+        let mut ident: Vec<(G1Affine, G2Prepared)> = Vec::new();
+        for t in terms.iter().take(8) {
+            ident.push((t.0, t.clone().1));
+            ident.push((t.0.neg(), t.clone().1));
+        }
+        let refs3: Vec<(&G1Affine, &G2Prepared)> =
+            ident.iter().map(|(a, b)| (a, b)).collect();
+        assert!(pairing_check(&refs3));
+        assert!(pairing_check_parallel(&refs3));
     }
 }

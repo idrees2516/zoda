@@ -1,0 +1,50 @@
+# =============================================================================
+# zoda — EigenDA mainnet pipeline configuration
+# =============================================================================
+#
+# The disperser/retriever pipeline this file drives lives in
+# crates/zoda-edas/src/pipeline.rs (zoda_edas::pipeline). Every key maps
+# 1:1 onto a field of EigenDaConfig; unknown keys fail loudly.
+#
+# Endpoint, EigenDADirectory and chain-ID values are mirrored from
+# Layr-Labs/eigenda `api/proxy/common/eigenda_network.go`. The v1
+# ServiceManager / BlsOperatorStateRetriever are the published mainnet
+# deployment constants — re-verify them against
+# https://docs.eigencloud.xyz/products/eigenda before using them to move
+# value.
+# =============================================================================
+
+[network]
+network = "mainnet"                      # mainnet | sepolia_testnet | hoodi_testnet
+eth_rpc = ""                             # operator-supplied Ethereum JSON-RPC endpoint
+
+[contracts]
+eigen_da_service_manager = "0xD9881F1a4c07f1c7Abb68c0ee244B940615d6343"
+bls_operator_state_retriever = "0x994e9E2aE0fed4E7E0f03F6E880B7F57F1588E46"
+
+[dispersal]
+confirmation_depth = 6                   # Ethereum blocks before a batch is final
+max_blob_length = 2097152                # 2 MiB (v1 mainnet; protocol ceiling 16 MiB)
+put_blob_encoding_version = 0            # v1 encoding
+status_query_interval_secs = 5           # blob-status poll cadence
+response_timeout_secs = 10               # disperser RPC round budget
+status_query_timeout_secs = 1800         # full finalisation budget (30 min)
+put_retries = 3                          # dispersal retries before surfacing an error
+
+[encoding]
+# EigenDA v1 disperses 8x Reed-Solomon (16 data chunks -> 128 coded
+# chunks). zoda's cell layer realises the same shape with the
+# EIP-7594 geometry: 4096 evaluations extended to 8192, 128 cells of 64
+# field elements, one FK20 proof per cell.
+rs_data_chunks = 16
+rs_coded_chunks = 128
+min_operators = 200                      # operator-set floor (v1 mainnet ~200)
+quorum_ids = [0, 1]                      # EigenDA v1 quorums
+
+[kzg]
+# The Ethereum mainnet ceremony SRS — the same trusted setup the EigenDA
+# disperser and verifiers run. Fetch it with:
+#   ./scripts/fetch_kzg_vectors.sh   (leaves spec-vectors/trusted_setup.txt)
+# or from github.com/ethereum/c-kzg-4844 (trusted_setup.txt).
+trusted_setup_path = "spec-vectors/trusted_setup.txt"
+certificate_verification = true          # verify certs against chain state locally

@@ -12,8 +12,8 @@
 
 use crate::g1::{G1Affine, G1Projective};
 use crate::g2::{G2Affine, G2Projective};
-use crate::hash::hash_to_curve_g2;
-use crate::pairing::{pairing_check, G2Prepared};
+use crate::hash::{hash_to_curve_g2, hash_to_curve_g2_batch};
+use crate::pairing::{final_exponentiation, multi_miller_loop, pairing_check, G2Prepared};
 use zoda_math::Fr;
 
 pub const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
@@ -149,6 +149,69 @@ fn batch_challenges(
     (pairing, subgroup)
 }
 
+/// Worker count for a batch verification: the available parallelism,
+/// engaged only when the batch is large enough that per-thread setup is
+/// amortised (≥ 8 items), capped by the item count and by 8.
+fn batch_threads(n: usize) -> usize {
+    if n < 8 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    cores.min(n).min(8)
+}
+
+/// The per-chunk workhorse of [`verify_batch`]: batched hash-to-curve,
+/// the plain scalar multiplications (pk/σ are untrusted — the h-torsion
+/// semantics of single verification must be preserved exactly), G2
+/// preparation of the hashed points, and the chunk's share of the
+/// Miller-loop accumulation. Returns the chunk's Miller product and its
+/// partial signature sum.
+#[allow(clippy::type_complexity)]
+fn verify_batch_chunk(
+    items: &[(&PublicKey, &[u8], &Signature)],
+    challenges: &[Fr],
+    strict: bool,
+) -> (crate::fp12::Fp12, G2Projective) {
+    let msgs: Vec<&[u8]> = items.iter().map(|(_, m, _)| *m).collect();
+    let hs = hash_to_curve_g2_batch(&msgs, DST);
+    let mut terms: Vec<(G1Affine, G2Prepared)> = Vec::with_capacity(items.len());
+    let mut sig_sum = G2Projective::identity();
+    for ((pk, _, sig), r) in items.iter().zip(challenges.iter()) {
+        let rp = if strict {
+            crate::endomorphism::mul_g1_public(&pk.to_projective(), r)
+        } else {
+            pk.to_projective().mul_limbs(&r.to_repr())
+        }
+        .to_affine();
+        terms.push((rp, G2Prepared::from(hs[terms.len()].to_affine())));
+        let rs = if strict {
+            crate::endomorphism::mul_g2_public(&sig.to_projective(), r)
+        } else {
+            sig.to_projective().mul_limbs(&r.to_repr())
+        };
+        sig_sum = sig_sum + rs;
+    }
+    let term_refs: Vec<(&G1Affine, &G2Prepared)> = terms.iter().map(|(a, b)| (a, b)).collect();
+    (multi_miller_loop(&term_refs), sig_sum)
+}
+
+/// Fold the accumulated signature sum into the pairing product with one
+/// extra serial Miller term and the single final exponentiation.
+fn finish_batch_pairing(
+    f: crate::fp12::Fp12,
+    sig_sum: &G2Projective,
+) -> bool {
+    let neg_g1 = G1Affine::generator().neg();
+    let sig_prepared = G2Prepared::from(sig_sum.to_affine());
+    let f = f * multi_miller_loop(&[(&neg_g1, &sig_prepared)]);
+    match final_exponentiation(&f) {
+        Some(v) => v.is_one(),
+        None => false,
+    }
+}
+
 /// Verify a batch of independent (pk, msg, sig) triples with one final
 /// exponentiation amortised over all items:
 ///
@@ -160,54 +223,75 @@ fn batch_challenges(
 /// (on-curve checks; h-torsion components pair to 1, exactly as in single
 /// verification, because the per-item scalar multiplications use the plain
 /// path on untrusted points).
+///
+/// v1.4: the per-item work — batched hash-to-curve (SSWU square roots
+/// via the complex method with Montgomery batch inversion), the scalar
+/// multiplications, G2 preparation and the Miller-loop accumulation — is
+/// chunked across worker threads; the threads' Fp12 products combine
+/// with `T−1` multiplications and the `Σ rᵢσᵢ` term folds in before one
+/// serial final exponentiation.
 pub fn verify_batch(items: &[(&PublicKey, &[u8], &Signature)]) -> bool {
     if items.is_empty() {
         return true;
     }
     let challenges = batch_challenges(items);
-    let mut terms: Vec<(G1Affine, G2Prepared)> = Vec::with_capacity(items.len() + 1);
-    let mut sig_sum = G2Projective::identity();
-    for ((pk, msg, sig), r) in items.iter().zip(challenges.0.iter()) {
+    for (pk, _, sig) in items.iter() {
         if pk.infinity || sig.infinity {
             return false;
         }
         if !pk.is_on_curve() || !sig.is_on_curve() {
             return false;
         }
-        // plain (non-GLV) multiplication: pk/σ are untrusted, and the
-        // h-torsion behaviour must match single verification exactly
-        let rp = pk.to_projective().mul_limbs(&r.to_repr()).to_affine();
-        terms.push((rp, G2Prepared::from(hash_to_curve_g2(msg, DST).to_affine())));
-        let rs = sig.to_projective().mul_limbs(&r.to_repr());
-        sig_sum = sig_sum + rs;
     }
-    let neg_g1 = G1Affine::generator().neg();
-    terms.push((neg_g1, G2Prepared::from(sig_sum.to_affine())));
-    let term_refs: Vec<(&G1Affine, &G2Prepared)> = terms.iter().map(|(a, b)| (a, b)).collect();
-    pairing_check(&term_refs)
+    let t = batch_threads(items.len());
+    if t <= 1 {
+        let (f, sig_sum) = verify_batch_chunk(items, &challenges.0, false);
+        return finish_batch_pairing(f, &sig_sum);
+    }
+    let chunk = items.len().div_ceil(t);
+    let mut f = crate::fp12::Fp12::one();
+    let mut sig_sum = G2Projective::identity();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .chunks(chunk)
+            .zip(challenges.0.chunks(chunk))
+            .map(|(ic, rc)| scope.spawn(move || verify_batch_chunk(ic, rc, false)))
+            .collect();
+        for h in handles {
+            match h.join() {
+                Ok((mf, ss)) => {
+                    f = f * mf;
+                    sig_sum = sig_sum + ss;
+                }
+                Err(_) => std::process::abort(),
+            }
+        }
+    });
+    finish_batch_pairing(f, &sig_sum)
 }
 
 /// Batch verification with full subgroup soundness: one Pippenger-based G1
 /// batch subgroup check over the public keys, one combined G2 check over
 /// the signatures, then the same product-pairing check as [`verify_batch`]
 /// — with GLV-accelerated scalar multiplications, since every point has
-/// been subgroup-verified first.
+/// been subgroup-verified first — parallelised across chunks exactly as
+/// [`verify_batch`].
 pub fn verify_batch_strict(items: &[(&PublicKey, &[u8], &Signature)]) -> bool {
     if items.is_empty() {
         return true;
     }
     let pks: Vec<PublicKey> = items.iter().map(|(pk, _, _)| **pk).collect();
     let sigs: Vec<Signature> = items.iter().map(|(_, _, sig)| **sig).collect();
-    if !crate::endomorphism::batch_subgroup_check_g2(&sigs) {
-        return false;
-    }
-    // individual on-curve and per-point G1 subgroup check via the batch
-    // combination (points must be on the curve first — decompression
-    // guarantees it, but re-check defensively for in-curve points)
-    for pk in &pks {
-        if pk.infinity || !pk.is_on_curve() {
+    for (pk, _, sig) in items.iter() {
+        if pk.infinity || sig.infinity {
             return false;
         }
+        if !pk.is_on_curve() || !sig.is_on_curve() {
+            return false;
+        }
+    }
+    if !crate::endomorphism::batch_subgroup_check_g2(&sigs) {
+        return false;
     }
     // batch the G1 subgroup checks: S = Σ cᵢ·pkᵢ with INDEPENDENT
     // challenges and PLAIN multiplications (correct semantics on any
@@ -228,22 +312,31 @@ pub fn verify_batch_strict(items: &[(&PublicKey, &[u8], &Signature)]) -> bool {
     }
     // every point is now subgroup-verified: the pairing product may use
     // the GLV fast path
-    let mut terms: Vec<(G1Affine, G2Prepared)> = Vec::with_capacity(items.len() + 1);
-    let mut sig_sum = G2Projective::identity();
-    for ((pk, msg, sig), r) in items.iter().zip(challenges.0.iter()) {
-        if sig.infinity {
-            return false;
-        }
-        let rp =
-            crate::endomorphism::mul_g1_public(&pk.to_projective(), r).to_affine();
-        terms.push((rp, G2Prepared::from(hash_to_curve_g2(msg, DST).to_affine())));
-        let rs = crate::endomorphism::mul_g2_public(&sig.to_projective(), r);
-        sig_sum = sig_sum + rs;
+    let t = batch_threads(items.len());
+    if t <= 1 {
+        let (f, sig_sum) = verify_batch_chunk(items, &challenges.0, true);
+        return finish_batch_pairing(f, &sig_sum);
     }
-    let neg_g1 = G1Affine::generator().neg();
-    terms.push((neg_g1, G2Prepared::from(sig_sum.to_affine())));
-    let term_refs: Vec<(&G1Affine, &G2Prepared)> = terms.iter().map(|(a, b)| (a, b)).collect();
-    pairing_check(&term_refs)
+    let chunk = items.len().div_ceil(t);
+    let mut f = crate::fp12::Fp12::one();
+    let mut sig_sum = G2Projective::identity();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .chunks(chunk)
+            .zip(challenges.0.chunks(chunk))
+            .map(|(ic, rc)| scope.spawn(move || verify_batch_chunk(ic, rc, true)))
+            .collect();
+        for h in handles {
+            match h.join() {
+                Ok((mf, ss)) => {
+                    f = f * mf;
+                    sig_sum = sig_sum + ss;
+                }
+                Err(_) => std::process::abort(),
+            }
+        }
+    });
+    finish_batch_pairing(f, &sig_sum)
 }
 
 /// Verify an aggregate signature from `pks` all over the same `msg`.
@@ -329,6 +422,31 @@ mod tests {
         // empty batch is trivially true
         assert!(verify_batch(&[]));
         assert!(verify_batch_strict(&[]));
+    }
+
+    #[test]
+    fn batch_verify_parallel_path() {
+        // 17 items: exercises the chunked threading (uneven chunks with
+        // 2 workers) and both the plain and strict paths, plus tamper
+        // rejection through the parallel combination
+        let items: Vec<(PublicKey, Vec<u8>, Signature)> = (0..17usize)
+            .map(|i| {
+                let sk = SecretKey::from_seed(format!("par batch key {}", i).as_bytes());
+                let msg = format!("par batch message {}", i).into_bytes();
+                let sig = sk.sign(&msg);
+                (sk.public_key(), msg, sig)
+            })
+            .collect();
+        let refs: Vec<(&PublicKey, &[u8], &Signature)> =
+            items.iter().map(|(p, m, s)| (p, m.as_slice(), s)).collect();
+        assert!(verify_batch(&refs));
+        assert!(verify_batch_strict(&refs));
+        let mut bad = items.clone();
+        bad[9].1 = b"tampered message".to_vec();
+        let refs: Vec<(&PublicKey, &[u8], &Signature)> =
+            bad.iter().map(|(p, m, s)| (p, m.as_slice(), s)).collect();
+        assert!(!verify_batch(&refs));
+        assert!(!verify_batch_strict(&refs));
     }
 
     #[test]

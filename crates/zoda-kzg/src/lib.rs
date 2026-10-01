@@ -24,7 +24,7 @@ pub use srs::{Setup, BLOB_BYTES, FIELD_ELEMENTS_PER_BLOB};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zoda_math::{Fr, ZodaRng};
+    use zoda_math::ZodaRng;
 
     fn test_setup() -> Setup {
         // Build a small deterministic setup for tests: [tau^i] with tau

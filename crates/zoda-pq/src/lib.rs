@@ -41,7 +41,7 @@ pub use rq::{fq_to_poly, Rq, RqVector};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zoda_math::{Fq, PrimeField, ZodaRng};
+    use zoda_math::{Fq, ZodaRng};
 
     #[test]
     fn commitment_roundtrip_fast() {

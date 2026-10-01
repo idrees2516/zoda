@@ -9,7 +9,6 @@ use crate::fp2::Fp2;
 use crate::g1::G1Projective;
 use crate::g2::G2Projective;
 use crate::h2c_consts::{g1_map, g2_map};
-use std::sync::OnceLock;
 
 /// Effective cofactor for the G1 suite (RFC 9380 §8.8.1).
 const G1_H_EFF: [u64; 1] = [0xd201000000010001];
@@ -155,48 +154,39 @@ pub fn hash_to_field_fp2(msg: &[u8], dst: &[u8], count: usize) -> Vec<Fp2> {
 // Simplified SWU + isogeny maps
 // ---------------------------------------------------------------------------
 
-/// The exponent (p² − 9)/16 as LE limbs (derived once).
-fn p2_minus_9_over_16() -> &'static [u64] {
-    static E: OnceLock<Vec<u64>> = OnceLock::new();
-    E.get_or_init(|| {
-        // p² − 9 as limbs, then >> 4.
-        let p: Vec<u64> = Fp::MODULUS.to_vec();
-        let mut sq = vec![0u64; 12];
-        for i in 0..6 {
-            let mut carry = 0u128;
-            for j in 0..6 {
-                let t = sq[i + j] as u128 + (p[i] as u128) * (p[j] as u128) + carry;
-                sq[i + j] = t as u64;
-                carry = t >> 64;
-            }
-            let mut idx = i + 6;
-            while carry > 0 && idx < 12 {
-                let t = sq[idx] as u128 + carry;
-                sq[idx] = t as u64;
-                carry = t >> 64;
-                idx += 1;
-            }
-        }
-        // subtract 9
-        let mut borrow = 9u128;
-        for limb in sq.iter_mut() {
-            let t = (*limb as u128).wrapping_sub(borrow);
-            *limb = t as u64;
-            borrow = (t >> 64) & 1;
-        }
-        // shift right 4
-        let mut c = 0u64;
-        for limb in sq.iter_mut().rev() {
-            let nc = *limb << 60;
-            *limb = (*limb >> 4) | c;
-            c = nc;
-        }
-        while sq.len() > 0 && *sq.last().unwrap() == 0 {
-            sq.pop();
-        }
-        sq
-    })
-}
+
+/// The exponent (p − 3)/4 as LE limbs — the classic square-root candidate
+/// exponent for `p ≡ 3 (mod 4)` (`sqrt(u/v) = u·v·(u·v³)^((p−3)/4)`),
+/// computed once at compile time.
+const SQRT_RATIO_EXP: [u64; 6] = {
+    let mut e = [
+        0xb9feffffffffaaab,
+        0x1eabfffeb153ffff,
+        0x6730d2a0f6b0f624,
+        0x64774b84f38512bf,
+        0x4b1ba7b6434bacd7,
+        0x1a0111ea397fe69a,
+    ];
+    // p - 3
+    let mut borrow = 3u128;
+    let mut i = 0;
+    while i < 6 {
+        let t = (e[i] as u128).wrapping_sub(borrow);
+        e[i] = t as u64;
+        borrow = (t >> 64) & 1;
+        i += 1;
+    }
+    // >> 2
+    let mut c = 0u64;
+    let mut j = 6;
+    while j > 0 {
+        j -= 1;
+        let nc = e[j] << 62;
+        e[j] = (e[j] >> 2) | c;
+        c = nc;
+    }
+    e
+};
 
 /// Simplified SWU for G1 (AB == 0 case) on the 11-isogenous curve.
 pub fn map_to_curve_sswu_g1_pub(u: &Fp) -> G1Projective {
@@ -224,31 +214,11 @@ fn map_to_curve_sswu_g1(u: &Fp) -> G1Projective {
     let gx_den = x_densq * x_den;
     let gx0_num = (x0_num * x0_num + a * x_densq) * x0_num + b * gx_den;
 
-    // sqrt candidate = uv·(uv³)^((p-3)/4) — the classic p ≡ 3 (mod 4) form
+    // sqrt(u/v) = u·v·(u·v³)^((p-3)/4) — windowed fixed-exponent ladder
     let uv = gx0_num * gx_den;
     let vsq = gx_den * gx_den;
-    // exponent (p-3)/4
-    let e = {
-        let mut e = Fp::MODULUS;
-        // subtract 3
-        let mut borrow = 3u128;
-        for limb in e.iter_mut() {
-            let t = (*limb as u128).wrapping_sub(borrow);
-            *limb = t as u64;
-            borrow = (t >> 64) & 1;
-        }
-        // >> 2
-        let mut c = 0u64;
-        for limb in e.iter_mut().rev() {
-            let nc = *limb << 62;
-            *limb = (*limb >> 2) | c;
-            c = nc;
-        }
-        e
-    };
-    // sqrt(u/v) = u·v·(u·v³)^((p-3)/4)
     let uv_v3 = uv * vsq;
-    let sqrt_candidate = uv * uv_v3.pow_limbs(&e);
+    let sqrt_candidate = uv * uv_v3.pow_windowed(&SQRT_RATIO_EXP);
 
     let gx0_is_square = sqrt_candidate * sqrt_candidate * gx_den == gx0_num;
     let x1_num = x0_num * xi_usq;
@@ -317,6 +287,21 @@ fn iso_map_g1(u: &G1Projective) -> G1Projective {
 }
 
 /// Simplified SWU for G2 (AB == 0 case) on the 3-isogenous curve.
+///
+/// The square root is computed by the **complex method** (two windowed Fp
+/// exponentiations by the compile-time constant `(p+1)/4` — the norm and
+/// the real part — replacing one 762-bit Fp2 exponentiation, ≈3.5×) and
+/// the division by the g(x) denominator is resolved with the standard
+/// homogeneous-coordinate trick instead of a field inversion:
+///
+/// with `u = g(x0)` as a numerator and `v` its denominator (`v = x_den³`),
+/// `y' = sqrt(u·v)` exists exactly when `g(x0)` is a square (their ratio
+/// `v²` is always a square) and the affine y is `y'/v`; the projective
+/// point `(x_num·x_den², y', v)` realises both denominators at once
+/// because `X/Z = x_num/x_den` and `Y/Z = y'/v`.
+///
+/// One norm-based Fp2 inversion remains for the sgn0 sign correction,
+/// which needs the true affine y — it costs a single Fp exponentiation.
 pub fn map_to_curve_sswu_g2_pub(u: &Fp2) -> G2Projective {
     map_to_curve_sswu_g2(u)
 }
@@ -338,66 +323,156 @@ fn map_to_curve_sswu_g2(u: &Fp2) -> G2Projective {
     let x0_num = b * (Fp2::one() + nd_common);
 
     let x_densq = x_den * x_den;
-    let gx_den = x_densq * x_den;
-    let gx0_num = (x0_num * x0_num + a * x_densq) * x0_num + b * gx_den;
+    let v = x_densq * x_den; // g(x) denominator
+    let gx0_num = (x0_num * x0_num + a * x_densq) * x0_num + b * v;
 
-    // sqrt candidate = uv⁷·(uv¹⁵)^((p²−9)/16)
-    let vsq = gx_den * gx_den;
-    let v3 = vsq * gx_den;
-    let v4 = vsq * vsq;
-    let v8 = v4 * v4;
-    let uv7 = gx0_num * v3 * v4;
-    let uv15 = uv7 * v8;
-    let sqrt_candidate = uv7 * uv15.pow_limbs(p2_minus_9_over_16());
-
-    // Test the candidate against the other square roots of unity.
-    let mut y = sqrt_candidate;
-    // multiply by i
-    let tmp = Fp2 {
-        c0: -sqrt_candidate.c1,
-        c1: sqrt_candidate.c0,
-    };
-    if tmp * tmp * gx_den == gx0_num {
-        y = tmp;
-    }
-    // multiply by RV1
-    let tmp = sqrt_candidate * g2_map::SSWU_RV1;
-    if tmp * tmp * gx_den == gx0_num {
-        y = tmp;
-    }
-    // multiply by RV1·i
-    let tmp = Fp2 {
-        c0: tmp.c1,
-        c1: -tmp.c0,
-    };
-    if tmp * tmp * gx_den == gx0_num {
-        y = tmp;
-    }
-
-    // g(x1(u)) = g(x0(u))·ξ³u⁶
+    // g(x1(u)) = g(x0(u))·ξ³u⁶ shares the denominator v
     let gx1_num = gx0_num * xi_usq * xisq_u4;
-    // sqrt candidate for x1: candidate·u³
-    let sc1 = sqrt_candidate * usq * *u;
-    let mut eta_found = false;
-    for eta in g2_map::SSWU_ETAS.iter() {
-        let tmp = sc1 * *eta;
-        if tmp * tmp * gx_den == gx1_num {
-            y = tmp;
-            eta_found = true;
+
+    // complex-method square roots; the branch taken (x0 vs x1) matches the
+    // reference implementation exactly because square-ness of u/v and u·v
+    // is equivalent (their ratio v² is a square)
+    let mut x_num = x0_num;
+    let mut yp = match (gx0_num * v).sqrt() {
+        Some(y) => y,
+        None => {
+            x_num = x0_num * xi_usq;
+            match (gx1_num * v).sqrt() {
+                Some(y1) => y1,
+                None => {
+                    // no square root at either candidate: the reference
+                    // implementation cannot produce a point here either
+                    // (it exhausts the same root-of-unity candidates).
+                    // This is unreachable for hash-to-field outputs and
+                    // reachable only for adversarially chosen u.
+                    return G2Projective {
+                        x: Fp2::zero(),
+                        y: Fp2::zero(),
+                        z: Fp2::zero(),
+                    };
+                }
+            }
+        }
+    };
+    // affine y for the sign correction: y = y'/v (one norm-based Fp2
+    // inversion — a single Fp exponentiation). The projective Y is then
+    // simply y'·(v/v): Y = y_affine·Z = (y'/v)·v = y'.
+    let vinv = match v.invert() {
+        Some(i) => i,
+        None => return G2Projective::identity(),
+    };
+    let y = yp * vinv;
+    if y.sgn0() != u.sgn0() {
+        yp = -yp;
+    }
+    // (x_num·x_den², y', v): X/Z = x_num/x_den, Y/Z = y'/v
+    G2Projective {
+        x: x_num * x_densq,
+        y: yp,
+        z: v,
+    }
+}
+
+/// Batch Simplified SWU for G2 — the hash-to-curve workhorse behind
+/// batch BLS verification. Per element the two 381-bit windowed
+/// exponentiations of the complex-method square root are computed in a
+/// first pass ([`Fp2::sqrt_batch`] defers every inversion), the g(x)
+/// denominators are inverted with a single Montgomery batch inversion,
+/// and only cheap multiplications remain for the assembly pass.
+///
+/// The output is bit-identical to [`map_to_curve_sswu_g2_pub`] on every
+/// input (the final point is unique: the x-branch is determined by
+/// square-ness, and the y sign by sgn0 equality).
+pub fn map_to_curve_sswu_g2_batch(us: &[Fp2]) -> Vec<G2Projective> {
+    // per-element staged numerator/denominator data
+    struct Staged {
+        x_densq: Fp2,
+        v: Fp2,
+        x0_num: Fp2,
+        x1_num: Fp2,
+        u0: Fp2,
+        u1: Fp2,
+        sgn_u: bool,
+    }
+    let stage = |u: &Fp2| -> Staged {
+        let a = g2_map::SSWU_ELLP_A;
+        let b = g2_map::SSWU_ELLP_B;
+        let xi = g2_map::SSWU_XI;
+        let usq = (*u) * (*u);
+        let xi_usq = xi * usq;
+        let xisq_u4 = xi_usq * xi_usq;
+        let nd_common = xisq_u4 + xi_usq;
+        let x_den = if nd_common.is_zero() {
+            a * xi
+        } else {
+            a * (-nd_common)
+        };
+        let x0_num = b * (Fp2::one() + nd_common);
+        let x_densq = x_den * x_den;
+        let v = x_densq * x_den;
+        let gx0_num = (x0_num * x0_num + a * x_densq) * x0_num + b * v;
+        let gx1_num = gx0_num * xi_usq * xisq_u4;
+        Staged {
+            x_densq,
+            v,
+            x0_num,
+            x1_num: x0_num * xi_usq,
+            u0: gx0_num * v,
+            u1: gx1_num * v,
+            sgn_u: u.sgn0(),
+        }
+    };
+
+    let staged: Vec<Staged> = us.iter().map(stage).collect();
+
+    // first sqrt round over g(x0)·v; NonSquare entries fall through to a
+    // second round over g(x1)·v (up to half the elements, still batched)
+    let w0: Vec<Fp2> = staged.iter().map(|s| s.u0).collect();
+    let r0 = Fp2::sqrt_batch(&w0);
+    let mut roots: Vec<Option<Fp2>> = r0;
+    let mut from_x1 = vec![false; staged.len()];
+    let retry: Vec<usize> = (0..staged.len())
+        .filter(|&i| roots[i].is_none())
+        .collect();
+    if !retry.is_empty() {
+        let w1: Vec<Fp2> = retry.iter().map(|&i| staged[i].u1).collect();
+        let r1 = Fp2::sqrt_batch(&w1);
+        for (k, &i) in retry.iter().enumerate() {
+            roots[i] = r1[k];
+            from_x1[i] = r1[k].is_some();
         }
     }
 
-    let x_num = if eta_found { x0_num * xi_usq } else { x0_num };
-    // sign correction: sgn0(y) == sgn0(u)
-    if y.sgn0() != u.sgn0() {
-        y = -y;
-    }
+    // one Montgomery batch inversion of the g(x) denominators
+    let vs: Vec<Fp2> = staged.iter().map(|s| s.v).collect();
+    let vinvs = Fp2::invert_batch(&vs);
 
-    G2Projective {
-        x: x_num,
-        y: y * x_den,
-        z: x_den,
-    }
+    // assembly: branch select + sign correction + homogeneous coordinates
+    staged
+        .iter()
+        .enumerate()
+        .map(|(i, s)| match roots[i] {
+            Some(yp) => {
+                let y = yp * vinvs[i];
+                let yp = if y.sgn0() != s.sgn_u { -yp } else { yp };
+                let x_num = if from_x1[i] { s.x1_num } else { s.x0_num };
+                // (x_num·x_den², y', v): X/Z = x_num/x_den and
+                // Y/Z = y'/v — the affine point of the single path
+                G2Projective {
+                    x: x_num * s.x_densq,
+                    y: yp,
+                    z: s.v,
+                }
+            }
+            // both candidates non-square: unreachable for hash-to-field
+            // outputs; parity with the single path's degenerate result
+            None => G2Projective {
+                x: Fp2::zero(),
+                y: Fp2::zero(),
+                z: Fp2::zero(),
+            },
+        })
+        .collect()
 }
 
 /// 3-isogeny map E' → E for G2.
@@ -471,6 +546,43 @@ pub fn hash_to_curve_g2(msg: &[u8], dst: &[u8]) -> G2Projective {
 pub fn encode_to_curve_g2(msg: &[u8], dst: &[u8]) -> G2Projective {
     let u = hash_to_field_fp2(msg, dst, 1)[0];
     crate::endomorphism::clear_cofactor_g2(&iso_map_g2(&map_to_curve_sswu_g2(&u)))
+}
+
+/// Batch hash to G2 (RO variant) — `hash_to_curve_g2` over many messages
+/// with the SSWU square roots batched ([`Fp2::sqrt_batch`]: every
+/// inversion deferred into two Montgomery batch inversions across the
+/// whole batch) and the map outputs assembled from pure multiplications.
+/// Bit-identical to the single-message path.
+pub fn hash_to_curve_g2_batch<'m, M: AsRef<[u8]> + Sync + 'm>(
+    msgs: &'m [M],
+    dst: &[u8],
+) -> Vec<G2Projective> {
+    // two field elements per message, flattened into one batch
+    let mut us: Vec<Fp2> = Vec::with_capacity(msgs.len() * 2);
+    for m in msgs {
+        us.extend(hash_to_field_fp2(m.as_ref(), dst, 2));
+    }
+    let mapped = map_to_curve_sswu_g2_batch(&us);
+    let mut out = Vec::with_capacity(msgs.len());
+    for i in 0..msgs.len() {
+        let q0 = iso_map_g2(&mapped[2 * i]);
+        let q1 = iso_map_g2(&mapped[2 * i + 1]);
+        out.push(crate::endomorphism::clear_cofactor_g2(&(q0 + q1)));
+    }
+    out
+}
+
+/// Batch hash to G1 (RO variant). The G1 SSWU is inversion-free (the
+/// numerator/denominator form), so the batch path shares only the
+/// windowed fixed-exponent ladder of the single path — kept for API
+/// symmetry with the G2 batch.
+pub fn hash_to_curve_g1_batch<'m, M: AsRef<[u8]> + Sync + 'm>(
+    msgs: &'m [M],
+    dst: &[u8],
+) -> Vec<G1Projective> {
+    msgs.iter()
+        .map(|m| hash_to_curve_g1(m.as_ref(), dst))
+        .collect()
 }
 
 #[cfg(test)]
@@ -594,4 +706,59 @@ mod tests {
             hex
         );
     }
+    #[test]
+    fn map_to_curve_sswu_g2_batch_matches_single() {
+        // differential: the batch complex-method SSWU must reproduce the
+        // single-element map bit-exactly on random u's (both x-branches,
+        // both sign corrections) including the RFC field elements
+        let dst = b"QUUX-V01-CS02-with-BLS12381G2_XMD:SHA-256_SSWU_RO_";
+        let mut us: Vec<Fp2> = Vec::new();
+        for i in 0..48 {
+            us.extend(hash_to_field_fp2(
+                format!("batch-diff message {}", i).as_bytes(),
+                dst,
+                2,
+            ));
+        }
+        let batch = map_to_curve_sswu_g2_batch(&us);
+        for (u, b) in us.iter().zip(batch.iter()) {
+            assert_eq!(*b, map_to_curve_sswu_g2(u), "batch != single map");
+        }
+    }
+
+    #[test]
+    fn hash_to_curve_g2_batch_matches_single() {
+        let dst = DST_G2;
+        let msgs: Vec<Vec<u8>> = (0..64)
+            .map(|i| format!("zoda verify_batch message {}", i).into_bytes())
+            .collect();
+        let batch = hash_to_curve_g2_batch(&msgs, dst);
+        assert_eq!(batch.len(), msgs.len());
+        for (m, b) in msgs.iter().zip(batch.iter()) {
+            assert_eq!(*b, hash_to_curve_g2(m, dst));
+            assert!(b.to_affine().is_on_curve());
+            assert!(!b.is_identity());
+        }
+        // batch result also verifies as a BLS hashed public key would
+        let single: Vec<G2Projective> =
+            msgs.iter().map(|m| hash_to_curve_g2(m, dst)).collect();
+        assert_eq!(batch, single);
+    }
+
+    #[test]
+    fn hash_to_curve_g1_batch_matches_single() {
+        let dst = DST_G1;
+        let msgs: Vec<Vec<u8>> = (0..16)
+            .map(|i| format!("g1 batch {}", i).into_bytes())
+            .collect();
+        let batch = hash_to_curve_g1_batch(&msgs, dst);
+        for (m, b) in msgs.iter().zip(batch.iter()) {
+            assert_eq!(*b, hash_to_curve_g1(m, dst));
+        }
+    }
+
+
+
+
+
 }

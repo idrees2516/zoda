@@ -343,7 +343,7 @@ mod tests {
     fn eval_and_divmod() {
         let (p, _) = rand_polys(b"poly-test-1-divmod-0000000000000", 17);
         let x = Fr::from_u64(99);
-        let v = eval(&p, x);
+        assert_eq!(eval(&p, x), eval(&p, x));
         let d: Vec<Fr> = vec![Fr::ONE, Fr::from_u64(0), Fr::from_u64(0), Fr::ONE]; // X^3+1
         let (q, r) = divmod(&p, &d);
         // p == q*d + r

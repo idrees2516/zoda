@@ -386,7 +386,6 @@ mod tests {
     #[test]
     fn evaluation_matches_naive() {
         let mut rng = ZodaRng::from_seed(*b"rq-eval-test-seed-00000000000000");
-        let n = 8;
         let coeffs: Vec<Fq> = (0..10).map(|_| Fq(rng.next_below(Q as u64) as u32)).collect();
         let z = Rq::from_i64(5);
         let got = eval_poly_at_ring(&coeffs, &z);

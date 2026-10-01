@@ -148,7 +148,7 @@ pub fn verify_message_inclusion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zoda_core::{ZodaParams, ZodaProver};
+    use zoda_core::ZodaParams;
     use zoda_math::ZodaRng;
 
     #[test]

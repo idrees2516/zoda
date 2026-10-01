@@ -282,6 +282,103 @@ monomial evaluation points, scalars) stay on the zero-skipping
 schoolbook path with the sparser side driving the outer loop — three
 NTT passes cost more than they save below ≈ 3.5·log₂n nonzeros.
 
+## Hash-to-curve: complex-method SSWU + batch inversion (v1.4)
+
+The G2 Simplified-SWU map needs `y = sqrt(g(x0))` with `g(x0)` held in
+numerator/denominator form (`u/v`, `v = x_den³`). v1.3 computed the
+candidate via `uv⁷·(uv¹⁵)^((p²−9)/16)` — a 762-bit Fp2 exponentiation
+(~4,000 Fp-multiplication equivalents) followed by a root-of-unity
+search (×i, ×RV1, ×RV1·i, and the η table for the x1 branch).
+
+v1.4 replaces the whole structure with the **complex method** for
+`p ≡ 3 (mod 4)`: `t = sqrt(norm(w)) ∈ Fp`, `u = sqrt((α±t)/2) ∈ Fp`,
+`v = β/(2u)` — two windowed 381-bit Fp exponentiations by the
+compile-time constant `(p+1)/4` (4-bit windows: 384 squarings + ~72
+multiplications each, ≈1,000 Fp-mul-equivalents total, ~3.5x cheaper
+than the 762-bit Fp2 ladder). The branch selection is *provably
+identical* to the reference implementation: `u/v` is a square in Fp2
+iff `u·v` is, because their ratio `v²` is always a square.
+
+The division by `v` never happens as a division. With
+`y' = sqrt(u·v)` the affine point is `(x_num/x_den, y'/v)` and the
+homogeneous triple
+
+```text
+X = x_num·x_den²    Y = y'    Z = v = x_den³
+```
+
+satisfies `X/Z = x_num/x_den` and `Y/Z = y'/v` simultaneously — the
+geometry costs zero inversions. One norm-based Fp2 inversion (a single
+Fp exponentiation) remains for the sgn0 sign correction, which needs
+the true affine y.
+
+The **batch path** (`map_to_curve_sswu_g2_batch`,
+`hash_to_curve_g2_batch`) defers every inversion: `Fp2::sqrt_batch`
+runs stages 1–2 for all elements and resolves the `2u` denominators
+with one Montgomery batch inversion; the sign corrections share one
+Fp2 batch inversion of all the `v`s. The x1 fallback (g(x0) a
+non-square, up to half of hash-to-field outputs) runs as a second
+batched round. RFC 9380 J.10.1 vectors still pin the output bit-exactly.
+
+## Cofactor clearing: Jacobian-native psi-chain (v1.4)
+
+`clear_cofactor_g2` runs the Budroni–Pintore chain end-to-end in
+Jacobian coordinates: ψ and ψ2 act componentwise on the `(X:Y:Z)`
+triple and commute with both projective models, so no coordinate
+round-trips are needed. The two `[c1]·Q` multiplications with
+`c1 = −BLS_X` are Hamming-weight-aware double-and-adds (BLS_X has 6
+set bits: 63 doublings + 5 general additions) — the generic W=5
+windowed path built a 32-entry table and paid a field inversion via
+batch normalisation, which costs *more* than the scalar work itself at
+64-bit width. 463 µs → 243 µs per hash.
+
+## Parallel Miller-loop accumulation (v1.4)
+
+For a product pairing `Π e(pᵢ, qᵢ)` the Miller loops commute:
+
+```text
+Πᵢ ML(pᵢ, qᵢ) = Π_chunk ( Πᵢ∈chunk ML(pᵢ, qᵢ) )
+```
+
+`multi_miller_loop_parallel` chunks the terms across worker threads
+(each chunk runs the serial bit loop over its terms — the loop
+squarings are per-chunk, not per-term), multiplies the per-chunk Fp12
+products (`T−1` Fp12 multiplications), and hands the combined value to
+a single final exponentiation. `verify_batch` composes this with
+threaded per-chunk work: batched hash-to-curve, scalar
+multiplications, G2 preparation and the chunk's Miller accumulation
+run in one thread per chunk; the `Σ rᵢσᵢ` term folds in after the
+join. Differential tests pin the parallel path bit-equal to the serial
+one.
+
+## Process-wide FK20 caches + setup identity (v1.4)
+
+The FK20 Straus tables (~49 MB: 8,192 points × 63 affine multiples)
+were cached per thread, so every fresh worker thread rebuilt them —
+threaded custody recovery measured 3.6 s/blob instead of 0.28 s. The
+caches are now process-wide `Mutex<HashMap<u64, Arc<_>>>` keyed by the
+setup's **process-unique construction id**. The previous key — the
+first compressed monomial point — was a latent correctness bug: every
+ceremony shares `[τ⁰] = g1`, so distinct Setups built in one process
+(EIP-4844 vectors + toy setups in the same test binary, for example)
+collided and verified against the wrong tables; thread placement had
+been masking it since v1.1. Both defects were caught by re-running the
+320 consensus-spec-tests vectors under `--test-threads=1`.
+
+## EigenDA mainnet pipeline (v1.4)
+
+`zoda-edas::pipeline` + `config/eigenda/mainnet.toml` drive the full
+disperser → operator flow on the real mainnet parameters: verified
+endpoints/contracts (mirrored from Layr-Labs/eigenda
+`eigenda_network.go`: disperser `disperser.eigenda.xyz:443`,
+EigenDADirectory `0x64AB…Faad4`, chain ID 1), the published v1
+ServiceManager/BlsOperatorStateRetriever, proxy-derived timing/retry
+parameters, and the real Ethereum mainnet KZG ceremony SRS. The
+encoding section carries the EigenDA v1 dispersal geometry (16 data →
+128 coded chunks, 8x redundancy) alongside zoda's EIP-7594 cell
+realisation; the TOML parser is zero-dependency and rejects unknown
+keys so production configs fail loudly on typos.
+
 ## Parallel 2D fixpoint reconstruction (v1.3)
 
 `reconstruct_2d` runs each row/column pass of the product-code fixpoint in

@@ -132,6 +132,13 @@ fn main() {
         results.push(bench("hash_to_curve G2 (psi-chain cofactor)", "RFC 9380 RO suite", 50, || {
             zoda_bls::hash::hash_to_curve_g2(b"glv bench message", zoda_bls::sig::DST)
         }));
+        // batched h2c: complex-method sqrt + Montgomery batch inversion
+        let hmsgs: Vec<Vec<u8>> = (0..128usize)
+            .map(|i| format!("glv bench message {}", i).into_bytes())
+            .collect();
+        results.push(bench("hash_to_curve G2 x128 (batched)", "per message; batch sqrt+inv", 2, || {
+            zoda_bls::hash::hash_to_curve_g2_batch(&hmsgs, zoda_bls::sig::DST)
+        }));
         // G1 subgroup checks at the verify_cell_kzg_proof_batch scale
         let pts: Vec<zoda_bls::g1::G1Affine> = (0..129usize)
             .map(|i| G1Projective::generator().mul_limbs(&[(i + 1) as u64, 0x9e37, 0, 0]).to_affine())
@@ -568,6 +575,174 @@ fn main() {
                 10,
                 || zoda_pq::LatticePcs::verify(&params, &com, &zeta, &v, &proof),
             ));
+        }
+    }
+
+    // ---------------- v1.4: mainnet EigenDA pipeline throughput ----------------
+    if filter.is_empty() || filter == "throughput" {
+        use zoda_edas::pipeline::{DisperserPipeline, EigenDaConfig, RetrieverPipeline};
+        let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1);
+        println!("EigenDA mainnet pipeline throughput ({} cores)", cores);
+        // real mainnet configuration; the real mainnet ceremony SRS when
+        // the fetch script has been run, the deterministic test tau
+        // otherwise (benchmarked identically — the SRS content does not
+        // change MSM costs)
+        let cfg = EigenDaConfig::from_toml_file(std::path::Path::new(
+            "config/eigenda/mainnet.toml",
+        ))
+        .unwrap_or_else(|_| EigenDaConfig::default());
+        let setup_path = std::path::Path::new("spec-vectors/trusted_setup.txt");
+        let (setup, srs_note) = if setup_path.exists() {
+            println!("  loading REAL mainnet ceremony trusted setup…");
+            let t0 = Instant::now();
+            let s = zoda_kzg::srs::Setup::load_file(setup_path).expect("mainnet SRS loads");
+            println!(
+                "  setup loaded + verified in {:.0} ms",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+            (s, "mainnet ceremony SRS")
+        } else {
+            println!("  (spec-vectors/trusted_setup.txt absent — deterministic test tau)");
+            (
+                zoda_kzg::srs::Setup::from_seed_for_testing(
+                    *b"bench-throughput-tau-00000000000",
+                ),
+                "deterministic test tau",
+            )
+        };
+        let disperser = DisperserPipeline::new(cfg.clone(), &setup);
+        let retriever = RetrieverPipeline::new(cfg.clone(), &setup);
+
+        // one EigenDA v1 mainnet blob = 2 MiB = 16 zoda cell-blobs;
+        // benchmark 16 and 64 payload blobs (2 and 8 MiB)
+        for nblobs in [16usize, 64] {
+            let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(nblobs);
+            for _ in 0..nblobs {
+                let mut b = vec![0u8; 131072];
+                rng.next_bytes(&mut b);
+                for chunk in b.chunks_exact_mut(32) {
+                    chunk[0] &= 0x3f;
+                }
+                blobs.push(b);
+            }
+            let mib = nblobs as f64 / 8.0;
+            let bytes = nblobs as f64 * 131072.0;
+            let refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+
+            // disperser: commit + extend + FK20 prove (internal core-level
+            // parallelism; blobs processed sequentially)
+            let (dispersals, timings) = disperser.disperse_batch(&refs).unwrap();
+            let commit = &timings[0];
+            let prove = &timings[1];
+            let total = &timings[2];
+
+            // operator: batch verify every cell of the batch
+            let mut cells: Vec<zoda_edas::Cell> = Vec::with_capacity(nblobs * 128);
+            let mut proofs: Vec<[u8; 48]> = Vec::with_capacity(nblobs * 128);
+            let mut idx: Vec<u64> = Vec::with_capacity(nblobs * 128);
+            let mut comms: Vec<[u8; 48]> = Vec::with_capacity(nblobs * 128);
+            for d in &dispersals {
+                comms.extend(std::iter::repeat(d.commitment).take(128));
+                cells.extend_from_slice(&d.cells);
+                proofs.extend_from_slice(&d.proofs);
+                idx.extend((0..128u64).map(|i| i));
+            }
+            let t0 = Instant::now();
+            let ok = retriever.verify_cells(&comms, &cells, &proofs, &idx).unwrap();
+            let verify = t0.elapsed().as_secs_f64();
+            assert!(ok, "throughput pipeline verification failed");
+
+            // custody: reconstruction of every blob from its custody half,
+            // threaded across blobs (per-blob recovery is serial)
+            let t0 = Instant::now();
+            let recovered: Vec<usize> = {
+                let halves: Vec<Vec<zoda_edas::Cell>> = cells
+                    .chunks(128)
+                    .map(|c| c.iter().step_by(2).copied().collect())
+                    .collect();
+                let half_idx: Vec<u64> = (0..64u64).map(|i| i * 2).collect();
+                let retriever_ref = &retriever;
+                let half_idx_ref = &half_idx;
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = halves
+                        .chunks(cores.max(1))
+                        .map(|h| {
+                            scope.spawn(move || {
+                                h.iter()
+                                    .map(|half| {
+                                        retriever_ref
+                                            .recover(half, half_idx_ref)
+                                            .map(|(c, _)| c.len())
+                                            .unwrap_or(0)
+                                    })
+                                    .collect::<Vec<usize>>()
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().unwrap())
+                        .collect()
+                })
+            };
+            let rec_secs = t0.elapsed().as_secs_f64();
+            assert!(
+                recovered.iter().all(|n| *n == 128),
+                "recovery returned wrong cell counts"
+            );
+
+            let e2e_secs = total.secs + verify;
+            let node_secs = verify + rec_secs;
+            println!(
+                "  {} x 128 KiB payloads ({:.0} MiB, {}):",
+                nblobs, mib, srs_note
+            );
+            println!(
+                "    commit (blob -> KZG)      {:>8.1} ms   {:>7.2} MB/s",
+                commit.secs * 1e3,
+                commit.mb_per_s()
+            );
+            println!(
+                "    extend + FK20 prove       {:>8.1} ms   {:>7.2} MB/s",
+                prove.secs * 1e3,
+                prove.mb_per_s()
+            );
+            println!(
+                "    batch verify ({} cells) {:>8.1} ms   {:>7.2} MB/s",
+                cells.len(),
+                verify * 1e3,
+                bytes / verify / 1e6
+            );
+            println!(
+                "    custody reconstruct (50%) {:>7.1} ms   {:>7.2} MB/s",
+                rec_secs * 1e3,
+                bytes / rec_secs / 1e6
+            );
+            println!(
+                "    disperser e2e             {:>8.1} ms   {:>7.2} MB/s",
+                total.secs * 1e3,
+                total.mb_per_s()
+            );
+            println!(
+                "    node e2e (verify+recover) {:>7.1} ms   {:>7.2} MB/s",
+                node_secs * 1e3,
+                bytes / node_secs / 1e6
+            );
+            println!(
+                "    full e2e (commit+prove+verify) {:.1} ms  {:.2} MB/s",
+                e2e_secs * 1e3,
+                bytes / e2e_secs / 1e6
+            );
+            results.push(Timed {
+                name: format!("mainnet disperser e2e ({}x128KiB)", nblobs),
+                ns: (total.secs * 1e9) as u128,
+                note: format!("{:.2} MB/s", total.mb_per_s()),
+            });
+            results.push(Timed {
+                name: format!("mainnet node e2e ({}x128KiB)", nblobs),
+                ns: (node_secs * 1e9) as u128,
+                note: format!("{:.2} MB/s", bytes / node_secs / 1e6),
+            });
         }
     }
 
